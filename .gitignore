@@ -16,7 +16,7 @@ dist/
 .eggs/
 .installed.cfg
 MANIFEST
-
+diffusers/
 # ====================
 # Environments
 # ====================
