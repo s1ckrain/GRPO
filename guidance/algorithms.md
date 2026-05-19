@@ -1,0 +1,498 @@
+# Algorithm Guidance
+
+## Table of Contents
+
+- [Overview](#overview)
+- [GRPO](#grpo)
+   - [Background](#background)
+   - [Dynamics Type](#dynamics-type)
+   - [Efficiency Strategies](#efficiency-strategies)
+     - [Mixing SDE and ODE](#mixing-sde-and-ode)
+     - [Decoupled Training and Inference Resolution](#decoupled-training-and-inference-resolution)
+   - [Regularization](#regularization)
+     - [KL-loss](#kl-loss)
+     - [GRPO-Guard](#grpo-guard)
+
+- [DPO](#dpo)
+
+- [DGPO](#dgpo)
+
+- [DiffusionNFT](#diffusionnft)
+
+- [AWM: Advantage Weighted Matching](#awm-advantage-weighted-matching)
+
+- [CRD: Centered Reward Distillation](#crd-centered-reward-distillation)
+
+- [References](#references)
+
+## Overview
+
+Flow-Factory provides unified implementations of state-of-the-art RL algorithms for flow-matching models. All algorithms share the same model adapter and reward interfaces, enabling direct comparison under controlled conditions.
+
+At a high level, the supported algorithms fall into two paradigms:
+
+- **Coupled paradigm (GRPO and variants)**: Training timesteps are coupled with the SDE-based sampling dynamics, requiring tractable log-probability computation for policy gradient optimization.
+- **Decoupled paradigm (DPO, DiffusionNFT, AWM, DGPO)**: Training timesteps are decoupled from the actual sampling dynamics, making them inherently solver-agnostic — any ODE solver can be used for trajectory generation without modifying the training procedure.
+
+## GRPO
+
+### Background
+
+GRPO has achieved significant success in Flow Matching models. In contrast to the standard deterministic ODE-style update rule:
+
+$$
+x_{t+\mathrm{d}t} = x_{t} + v_{\theta}(x_t, t) \mathrm{d}t
+$$
+
+References [[1]](#ref1) and [[2]](#ref2) incorporate noise to facilitate RL exploration, proposing the following SDE-based update rule:
+
+$$
+x_{t+\mathrm{d}t} = x_{t} + [v_{\theta}(x_t, t) + \frac{\sigma_{t}^{2}}{2t}(x_t + (1-t)v_{\theta}(x_t, t))]\mathrm{d}t + \sigma_{t} \sqrt{\mathrm{d}t} \epsilon
+$$
+
+where $\epsilon \sim \mathcal{N}(0, I)$ and $\sigma_t$ denotes the noise schedule. This SDE formulation enables the log-probability computation required for policy gradient optimization.
+
+The formulation of $\sigma_t$ differs between methods: it is defined as $\eta\sqrt{\frac{t}{1-t}}$ in Flow-GRPO [[1]](#ref1) and as $\eta$ in DanceGRPO [[2]](#ref2), where $\eta \in [0,1]$ is a hyperparameter controlling the noise level. See the [Dynamics Type](#dynamics-type) section for a complete summary.
+
+This algorithm is implemented as `grpo`. To use this algorithm, set config with:
+
+```yaml
+train:
+    trainer_type: grpo
+```
+
+### Dynamics Type
+
+Flow-Factory implements multiple SDE dynamics through a unified `SDESchedulerMixin` interface. Users can switch between formulations via a single configuration parameter, facilitating systematic comparison of their effects on training stability and sample quality.
+
+| Dynamics   | Noise Schedule $\sigma_t$              | Reference                    |
+|------------|----------------------------------------|------------------------------|
+| `Flow-SDE` | $\eta\sqrt{t/(1-t)}$                 | Flow-GRPO [[1]](#ref1)       |
+| `Dance-SDE`| $\eta$ (constant)                     | DanceGRPO [[2]](#ref2)       |
+| `CPS`      | $\sigma_{t-1}\sin(\eta\pi/2)$        | FlowCPS [[9]](#ref9)         |
+| `ODE`      | $0$ (deterministic)                   | For NFT [[7]](#ref7) / DGPO [[8]](#ref8) / AWM [[10]](#ref10) |
+
+To switch between these formulations, set:
+
+```yaml
+train:
+    dynamics_type: 'Flow-SDE' # Options are ['Flow-SDE', 'Dance-SDE', 'CPS', 'ODE'].
+```
+
+> **Note**: `ODE` dynamics produce deterministic trajectories and cannot provide log-probability estimates. Therefore, `ODE` can only be used with decoupled algorithms such as `NFT`, `AWM`, and `DGPO`. See the [DiffusionNFT](#diffusionnft), [AWM](#awm-advantage-weighted-matching), and [DGPO](#dgpo) sections.
+
+
+### Efficiency Strategies
+
+
+#### Mixing SDE and ODE
+
+Training with the original Flow-GRPO and DanceGRPO methods is computationally expensive, as they require computing log probabilities and optimizing across all denoising steps.
+
+Subsequent works, such as MixGRPO [[3]](#ref3) and TempFlow-GRPO [[4]](#ref4), investigated the effects of mixing ODE and SDE denoising rules. They found that applying SDE updates for only $1\sim 2$ steps—and optimizing only those corresponding steps—is sufficient. This approach significantly reduces the cost of the optimization stage and results in faster performance improvements.
+
+To control this behavior, you can configure `train_steps` and `num_train_steps` as follows:
+
+```yaml
+train:
+    # Candidate steps for SDE noise (early steps typically provide more sample diversity)
+    train_steps: [1, 2, 3] 
+    
+    # Randomly select `1` step from the specified `train_steps` list (e.g., step 2) 
+    # to use SDE denoising. All other steps will use the standard ODE solver.
+    num_train_steps: 1
+```
+
+#### Decoupled Training and Inference Resolution
+
+Flow-GRPO demonstrates that *lower-quality images, generated via fewer denoising steps, are often sufficient for reward computation and GRPO optimization*. PaCo-RL[[6]](#ref6) validates this insight from the perspective of **resolution**.
+
+Research indicates that training on moderately low-resolution images yields sufficient reward signals to guide optimization effectively. Furthermore, *performance gains achieved at lower resolutions successfully transfer to high-resolution outputs*. Given that the computational complexity of modern Diffusion Transformers grows quadratically with image resolution, this decoupling significantly reduces training costs.
+
+You can configure a smaller resolution for the sampling and optimization loop while maintaining the target resolution for inference and evaluation:
+
+```yaml
+train:
+    resolution: 256  # Reduced resolution (int or [height, width]) for faster RL loops
+eval:
+    resolution: 1024 # Full resolution for validation and inference
+```
+
+### Regularization
+
+#### KL-Loss
+
+To tame the policy model's behavior and maintain proximity to the original reference model, two types of KL loss are available:
+
+```yaml
+train:
+    kl_type: 'v-based' # Options: 'x-based', 'v-based'
+    kl_beta: 0.04 # KL divergence beta
+    ref_param_device: 'same_as_model' # Options: cpu, same_as_model
+```
+
+Here, `x-based` calculates the KL loss in the **latent space**,
+while v-based calculates it in the **predicted velocity space** (or **noise space**).
+The `kl_beta` parameter controls the coefficient of the KL divergence term.
+
+**Memory Considerations**: Since calculating KL loss requires maintaining a copy of the original model, *VRAM usage scales with the number of trainable parameters*. 
+- **LoRA Training**: The overhead is minimal and efficient.
+- **Full-Parameter Fine-Tuning**: The overhead is significant. You may want to set `ref_param_device` to `cpu` to save memory.
+- **No KL-Loss**: Setting `kl_beta` to `0` automatically disables this term and eliminates extra memory usage.
+
+
+#### GRPO-Guard
+
+The SDE formulation used in Flow-GRPO[[1]](#ref1) and DanceGRPO[[2]](#ref2) inherently results in a *negatively biased ratio distribution* during GRPO optimization. GRPO-Guard [[5]](#ref5) analyzes this phenomenon and proposes a normalization technique to mitigate reward hacking.
+
+This normalization aligns with the time-step-dependent (and noise-level-dependent) loss re-weighting strategy introduced in TempFlow-GRPO[[4]](#ref4). By rebalancing the gradient contributions across different time steps, this strategy stabilizes training and effectively reduces reward hacking.
+
+To enable this reweighting strategy, switch the `trainer_type` to `grpo-guard`:
+```yaml
+train:
+    trainer_type: 'grpo-guard'
+    dynamics_type: 'Flow-SDE'
+```
+> ‼️ **Note**: Currently, `grpo-guard` reweighting is only compatible with `Flow-GRPO` dynamics. Therefore, dynamics_type must be explicitly set to `Flow-SDE`.
+
+## DPO
+
+DPO (Direct Preference Optimization) [[11]](#ref11) is a **decoupled** algorithm that optimises a pairwise preference loss on flow-matching velocity targets. Instead of per-sample policy-gradient ratios, it forms chosen/rejected pairs within each group (based on per-sample advantages), then minimises a Bradley-Terry preference loss over the DSM errors of the two policies (current vs. frozen reference). To use this algorithm, set:
+
+```yaml
+train:
+    trainer_type: 'dpo'
+```
+
+### Core Parameters
+
+```yaml
+train:
+    beta: 2000.0              # DPO temperature; larger ⇒ sharper preference contrast.
+    ref_param_device: 'cuda'  # Device to store frozen reference parameters ('cpu' or 'cuda').
+```
+
+### Pair Formation & Advantage
+
+DPO forms chosen/rejected pairs at the **start** of `optimize()` after `prepare_feedback()` has stored per-sample advantages. The `advantage_aggregation` controls how multi-reward advantages are combined:
+
+```yaml
+train:
+    advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'. 'gdpo' normalizes each reward independently.
+    global_std: true               # Global std normalization across all samples (vs. per-prompt).
+```
+
+### Training Timestep Distribution
+
+```yaml
+train:
+    num_train_timesteps: 1              # Number of freshly sampled training timesteps per pair.
+    weighting_scheme: 'logit_normal'    # Options: 'logit_normal', 'uniform'.
+    logit_mean: 0.0                     # Mean for logit-normal sampling.
+    logit_std: 1.0                      # Std for logit-normal sampling.
+    time_shift: 1.0                     # Shift parameter (1.0 = no shift).
+    timestep_range: 0.99               # Float ⇒ (0, x); tuple ⇒ (lo, hi).
+```
+
+## DGPO
+
+DGPO (Direct Group Preference Optimization) [[8]](#ref8) is a **decoupled** algorithm that optimises a group-level preference loss on flow-matching targets. In particular, DGPO optimizes group-level preferences directly, extending the Direct Preference Optimization (DPO) framework to handle pairwise groups instead of pairwise samples. In concrete coding practice, DGPO implements a gradient-equivalent loss which aggregates each group's advantage-weighted DSM delta (current vs. reference) through a sigmoid and reweights every sample's DSM loss by the resulting per-group scalar. Training samples use `trajectory_indices=[-1]` and `compute_log_prob=False`; fresh timesteps are drawn from `TimeSampler` at each optimisation step. To use this algorithm, set:
+
+```yaml
+train:
+    trainer_type: 'dgpo'
+```
+
+Because the objective contrasts the current policy against a reference model, DGPO **always requires** a reference model (`requires_ref_model = True`).
+
+### Core Loss Coefficients
+
+```yaml
+train:
+    dpo_beta: 100.0           # DPO beta scaling for group preference; larger ⇒ sharper sigmoid weighting.
+    kl_type: 'v-based'        # DGPO only supports v-based KL (other values are auto-coerced with a warning).
+    kl_beta: 0.0              # KL penalty weight. 0 disables the KL term entirely.
+    kl_cfg: 1.0               # CFG scale applied to the frozen reference. >1 enables CFG on the KL reference branch.
+    guidance_scale: 4.5       # CFG during rollout process.
+```
+
+### Guidance on Hyper-parameter tuning
+
+DGPO supports two modes: 1) rollout with CFG, training without CFG; 2) CFG-free in both rollout and training.
+
+For the "rollout with CFG, training without CFG" mode, DGPO can achieve relatively fast training convergence and better OOD performance. As for the key hyperparameters, the reference model is typically frozen without CFG, the dpo_beta is generally set to 10 ~ 100 and clip_range is generally set to 1e-3 ~ 1e-2.
+
+```yaml
+# rollout with CFG, training without CFG
+train:
+    dpo_beta: 100.0           # DPO beta scaling for group preference; larger ⇒ sharper sigmoid weighting.
+    kl_type: 'v-based'        # DGPO only supports v-based KL (other values are auto-coerced with a warning).
+    kl_beta: 0.001            # KL penalty weight. 0 disables the KL term entirely.
+    kl_cfg: 1.0               # CFG scale applied to the frozen reference. >1 enables CFG on the KL reference branch.
+    guidance_scale: 4.5       # CFG during rollout process.
+    clip_range: 1.0e-3        # PPO clip range (scalar is expanded to (-c, c)).
+```
+
+For the "CFG-free" mode, DGPO can achieve significantly faster convergence, but generally at the cost of some OOD performance. In this mode, it is recommended to use a small PPO-style clipping range by default: 1e-5 ~ 1e-4 for stable training. There are two settings for the reference model: one is to use a frozen reference model w/ CFG, in which case dpo_beta is typically set within the range of 10 ~ 100:
+
+```yaml
+#  CFG-free in both rollout and training. With frozen reference model.
+train:
+    dpo_beta: 100.0           # DPO beta scaling for group preference; larger ⇒ sharper sigmoid weighting.
+    kl_type: 'v-based'        # DGPO only supports v-based KL (other values are auto-coerced with a warning).
+    kl_beta: 0.001            # KL penalty weight. 0 disables the KL term entirely.
+    kl_cfg: 4.5               # CFG scale applied to the frozen reference. >1 enables CFG on the KL reference branch.
+    guidance_scale: 1.0       # CFG during rollout process.
+    clip_range: 1.0e-5        # PPO clip range (scalar is expanded to (-c, c)).
+```
+
+Another choice for the reference model in "CFG-free" mode is to use an EMA model as a dynamic reference model, as proposed in TDM-R1 [[12]](#ref12). In this case, dpo_beta is typically set within a larger range of 2000 ~ 5000:
+
+```yaml
+#  CFG-free in both rollout and training. With dynamic reference model.
+train:
+    dpo_beta: 2000.0           # DPO beta scaling for group preference; larger ⇒ sharper sigmoid weighting.
+    kl_type: 'v-based'        # DGPO only supports v-based KL (other values are auto-coerced with a warning).
+    kl_beta: 0.001            # KL penalty weight. 0 disables the KL term entirely.
+    kl_cfg: 1.0               # CFG scale applied to the reference. >1 enables CFG on the KL reference branch.
+    guidance_scale: 1.0       # CFG during rollout process.
+    clip_range: 1.0e-5        # PPO clip range (scalar is expanded to (-c, c)).
+```
+
+
+### Shared RNG across Groups
+
+Cross-rank-deterministic sampling of both the training timesteps and the per-group noise (seeded from `(seed, epoch, inner_epoch, uid)`). The per-group noise is **timestep-invariant** — all training timesteps within an epoch share the same noise, matching the reference implementation. No `dist.broadcast` / RNG fork is used:
+
+```yaml
+train:
+    use_shared_noise: true    # Same noise for every sample within a group at each step.
+```
+
+### PPO-style Clipping and EMA reference model
+
+A fast-tracking EMA copy of the trainable parameters (`ema_ref`, distinct from the slow sampling EMA) acts as the "old policy" for PPO-style clipping on the DSM / KL losses:
+
+```yaml
+train:
+    clip_dsm: true            # Clip the DSM loss when the ratio exits clip_range.
+    clip_kl: false            # Optionally clip the KL loss using the same ratio mask.
+    clip_range: 1.0e-2        # PPO clip range (scalar is expanded to (-c, c)).
+    adv_clip_range: 5.0       # Advantage clipping range.
+    use_ema_ref: false        # If true, use ema_ref (not the frozen ref) as the DGPO loss reference (TDM-R1 dynamic ref).
+
+    ema_ref_max_decay: 0.3    # Cap of the adaptive decay.
+    ema_ref_ramp_rate: 1.0e-3 # Adaptive decay = min(ema_ref_max_decay, ema_ref_ramp_rate * step).
+    ema_ref_device: 'cuda'    # Where ema_ref parameters live.
+```
+
+`clip_dsm`, `clip_kl`, or `use_ema_ref` being enabled triggers the creation and per-step update of `ema_ref`; otherwise no fast EMA is maintained.
+
+### Sampling Policy Switch
+
+```yaml
+train:
+    off_policy: false         # If true, use the slow sampling EMA for trajectory generation from step 0.
+    switch_ema_ref: 200       # After this many optimizer steps, swap to ema_ref (fast EMA) for sampling.
+```
+
+### Training Timestep Distribution
+
+```yaml
+train:
+    num_train_timesteps: 0    # 0 ⇒ int(num_inference_steps * (timestep_range[1] - timestep_range[0])).
+    time_sampling_strategy: 'discrete'  # Options: discrete, discrete_with_init, discrete_wo_init, uniform, logit_normal.
+    time_shift: 3.0           # Shift for logit_normal / uniform strategies.
+    timestep_range: 0.6       # Float ⇒ (0, x); tuple ⇒ (lo, hi) along the 1000→0 denoise axis.
+```
+
+> **Note**: DGPO feeds scheduler-scale timesteps (`[0, 1000]`) into `flow_match_sigma` before constructing `x_t = (1 - σ) x_0 + σ ε`. Training directly on unscaled timesteps would drive reward downward — the σ-scaling is mandatory for correct flow-matching behaviour.
+
+### Group Completeness
+
+DGPO's group-level sigmoid reweighting is only meaningful if every optimizer step sees a **complete group** (all `K = group_size` copies of each prompt). Flow-Factory guarantees this by requiring `GroupDistributedSampler` for DGPO (auto-forced by `Arguments._resolve_sampler_type`).
+
+**How it works**: `GroupDistributedSampler` yields the same prompt-index sequence on every rank; each prompt appears `K / W` times per rank (`W` = `num_replicas`). Since all ranks see the same prompts, local `torch.unique` produces a cross-rank-consistent dense group-id space — no `gather_samples` or cross-rank id coordination is needed. The single `accelerator.reduce` inside `_compute_group_dgpo_loss` sums partial per-rank contributions to recover the full-group sigmoid weight.
+
+**Geometric constraint**: `(num_replicas × per_device_batch_size) % group_size == 0` must hold so that every global micro-batch packs an integer number of complete groups. `Arguments._align_for_group_distributed` auto-adjusts `group_size` (and then `unique_sample_num_per_epoch`) at init time to satisfy this, so no manual tuning is needed.
+
+For a complete runnable setup, see `examples/dgpo/lora/sd3_5/default.yaml`.
+
+## DiffusionNFT
+
+This algorithm is introduced in [[7]](#ref7). Unlike GRPO, which couples sampling dynamics with training timesteps, **DiffusionNFT** decouples them entirely by optimizing a contrastive objective directly on the forward flow-matching process.
+
+Concretely, DiffusionNFT contrasts implicit positive and negative policies ($v_\theta^+$ and $v_\theta^-$), weighted by a normalized reward $r \in [0, 1]$, to identify a policy improvement direction *without* requiring tractable likelihood estimation or SDE-based sampling. This makes the algorithm inherently solver-agnostic.
+
+To use this algorithm, set:
+
+```yaml
+train:
+    trainer_type: 'nft'
+```
+
+Since DiffusionNFT decouples training from sampling dynamics, you can freely choose the sampling solver. Using the `ODE` solver during sampling typically yields higher image quality:
+
+```yaml
+train:
+  num_train_timesteps: 2 # Number of timesteps to train on. Set `null` to all timesteps.
+  time_sampling_strategy: discrete_with_init # Options: uniform, logit_normal, discrete, discrete_with_init, discrete_wo_init
+  time_shift: 3.0
+  timestep_fraction: 0.3 # Train using only the first 30% of timesteps.
+
+scheduler:
+    dynamics_type: 'ODE' # Other options are also available.
+```
+
+> **Note**: Since Reinforcement Learning typically requires exploration, it is often beneficial to experiment with SDE-based `dynamics_type` settings as well. Using `CPS`[[9]](#ref9) for NFT sampling is also a good choice.
+
+### Old Policy via EMA
+
+The original DiffusionNFT implementation maintains two separate EMA copies of the model: one for general EMA smoothing and one as the "old policy" used for off-policy sampling. Flow-Factory simplifies this design by retaining only a single EMA copy that serves as the old policy. This reduces memory overhead while preserving the core stabilization mechanism.
+
+When `off_policy` is enabled, the EMA model is used to generate trajectories during sampling, while the current policy is optimized against these trajectories. This off-policy setup stabilizes training by preventing the sampling distribution from shifting too rapidly.
+
+```yaml
+train:
+  off_policy: true  # Use EMA parameters for off-policy sampling
+  ema_decay_schedule: "piecewise_linear"  # Options: constant, power, linear, piecewise_linear, cosine, warmup_cosine
+  ema_decay: 0.5        # EMA decay rate (0 to disable)
+  ema_update_interval: 1  # EMA update interval (in epochs)
+  ema_device: "cuda"      # Device to store EMA model (options: cpu, cuda)
+```
+
+> **Tip**: The `piecewise_linear` schedule is recommended for DiffusionNFT. It starts with a lower decay rate to allow faster initial policy divergence and gradually increases the decay to stabilize later training. You can fine-tune this behavior with `flat_steps` and `ramp_rate`.
+
+## AWM: Advantage Weighted Matching
+
+This algorithm is introduced in [[10]](#ref10). **Advantage Weighted Matching** further aligns RL optimization with the flow-matching pretraining objective by weighting the standard velocity matching loss with per-sample advantages. This formulation incorporates reward-based guidance directly into the velocity matching loss, effectively aligning the optimization target with the original flow-matching objective.
+
+Like DiffusionNFT, AWM decouples training from sampling dynamics and is therefore solver-agnostic. To use this algorithm, set:
+
+```yaml
+train:
+    trainer_type: 'awm'
+```
+
+The relevant sampling and timestep configuration parameters are the same as those described in the [DiffusionNFT](#diffusionnft) section.
+
+### Training Stability
+
+AWM typically converges faster than other algorithms due to its direct advantage weighting on the velocity matching loss. However, this rapid update dynamic also makes it more prone to training instability — the policy can diverge quickly if left unconstrained, leading to reward hacking or training collapse.
+
+To stabilize AWM training, it is strongly recommended to combine **EMA-based KL regularization** with **PPO-style clipping**:
+
+```yaml
+train:
+  trainer_type: 'awm'
+  # EMA KL regularization: penalizes deviation from the EMA-smoothed policy
+  ema_kl_beta: 0.1        # Coefficient of KL loss between current policy and EMA policy
+  ema_decay: 0.9           # EMA decay rate
+  ema_decay_schedule: 'power'  # Options: constant, power, linear, piecewise_linear, cosine, warmup_cosine
+  ema_update_interval: 1   # EMA update interval (in epochs)
+  ema_device: "cuda"
+  # PPO-style clipping: prevents excessively large policy updates
+  clip_range: 1.0e-5       # Clipping range for the policy ratio
+  adv_clip_range: 5.0      # Advantage clipping range
+```
+
+> ‼️ **Important**: Disabling both `ema_kl_beta` and `clip_range` simultaneously is **not recommended** for AWM, as the unconstrained advantage weighting can easily lead to training collapse. In practice, `ema_kl_beta` serves as a soft constraint that keeps the current policy close to a moving average, while `clip_range` provides a hard constraint on per-step policy updates.
+
+### AWM Weighting
+
+AWM computes a per-sample matching loss $\ell = \|v_\theta(x_t, t) - ({\epsilon} - {x}_0)\|^2$ and then applies a weighting function $w(\ell, t)$ before multiplying by the advantage. Different weighting strategies control how the raw matching loss magnitude and timestep position influence the gradient signal:
+
+```yaml
+train:
+  awm_weighting: 'ghuber'  # Options: Uniform, t, t**2, huber, ghuber
+  ghuber_power: 0.25        # Power parameter for generalized Huber weighting (only used with 'ghuber')
+```
+
+| Weighting  | Formula $w(\ell, t)$                                                  | Description                                                                                           |
+|------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------|
+| `Uniform`  | $\ell$                                                                | No reweighting. All timesteps contribute equally.                                                     |
+| `t`        | $t \cdot \ell$                                                        | Linear timestep weighting. Upweights noisier (larger $t$) timesteps.                                  |
+| `t**2`     | $t^2 \cdot \ell$                                                      | Quadratic timestep weighting. More aggressively upweights noisier timesteps.                          |
+| `huber`    | $t \cdot (\sqrt{\ell + \varepsilon} - \varepsilon)$                   | Huber-style loss that suppresses large matching errors, weighted by $t$.                              |
+| `ghuber`   | $\frac{t}{p} \cdot ((\ell + \varepsilon)^{p} - \varepsilon^{p})$     | Generalized Huber loss with power $p$ (`ghuber_power`). Provides tunable robustness against outliers. |
+
+Here $\varepsilon$ is a small constant for numerical stability and $p$ denotes `ghuber_power` (default `0.25`).
+
+> **Tip**: `ghuber` with a small power (e.g., `0.25`) provides a good balance between robustness and gradient signal strength. `Uniform` is the simplest baseline and works well when reward signals are clean and low-variance.
+
+> **Note**: Like DPO, DGPO, DiffusionNFT, and AWM are foward-diffusion based RL algorithms, which decouples training from sampling dynamics and is solver-agnostic — any ODE/SDE solver can be used for trajectory generation.
+
+
+## CRD: Centered Reward Distillation
+
+This algorithm is introduced in [[13]](#ref13). **Centered Reward Distillation (CRD)** is a forward-process RL method that matches implicit model rewards (estimated from prediction error in velocity space) with centered external rewards. The key insight is that the unknown prompt-dependent normalizer cancels under *within-prompt centering*, yielding a well-posed reward-matching objective.
+
+CRD maintains two named parameter snapshots alongside the current model:
+- **Old model** (`_crd_old`): used to estimate implicit rewards via prediction error difference.
+- **Sampling model** (`_crd_sampling`): used for off-policy rollout generation, blended toward the current model over time.
+
+To use this algorithm, set:
+
+```yaml
+train:
+    trainer_type: 'crd'
+```
+
+### Key Hyperparameters
+
+```yaml
+train:
+  trainer_type: 'crd'
+
+  # CRD loss
+  crd_beta: 1.0           # Scaling factor for reward-matching loss
+  crd_loss_type: 'mse'    # Options: mse, bce
+  use_old_for_loss: true  # Use old model snapshot for implicit reward (recommended)
+  adaptive_logp: true     # Adaptive per-sample weighting of implicit reward terms
+  weight_temp: -1.0       # Softmax temperature τ for centering (-1 = uniform/τ→∞)
+
+  # Model snapshot decay schedules
+  # Format: "start_step-start_value-slope-end_value" or int preset key
+  old_model_decay: "0-0.25-0.005-0.999"      # Paper (OCR): min(0.25 + 0.005t, 0.999)
+  sampling_model_decay: "75-0.0-0.0075-0.999" # Paper (OCR): delayed start at step 75
+
+  # KL regularization anchored to CFG-guided pretrained reference
+  kl_beta: 0.1            # KL coefficient
+  kl_cfg: 4.5             # CFG scale for teacher reference model
+  reward_adaptive_kl: true  # Scale KL by reward to accelerate early learning
+  ref_param_device: 'cuda'
+
+  # Timestep sampling
+  timestep_range: 0.99    # Top 99% of denoising steps (original CRD default)
+  num_train_timesteps: 20
+  time_sampling_strategy: discrete
+  time_shift: 3.0
+
+  # Advantage clipping
+  adv_clip_range: 5.0
+```
+
+### Centering Modes (`weight_temp`)
+
+| `weight_temp` | Mode | Description |
+|---|---|---|
+| `< 0` | Uniform (τ→∞) | Simple mean centering; recommended default |
+| `== 0` | Hard selection | Positive pool (adv > 0) vs negative pool (adv < 0) |
+| `> 0` | Softmax temperature | Dual-direction: `softmax(adv/τ)` and `softmax(-adv/τ)` |
+
+
+## References
+
+* <a name="ref1"></a>[1] [**Flow-GRPO:** Training Flow Matching Models via Online RL](https://arxiv.org/abs/2505.05470)
+* <a name="ref2"></a>[2] [**DanceGRPO:** Unleashing GRPO on Visual Generation](https://arxiv.org/abs/2505.07818)
+* <a name="ref3"></a>[3] [**MixGRPO:** Unlocking Flow-based GRPO Efficiency with Mixed ODE-SDE](https://arxiv.org/abs/2507.21802)
+* <a name="ref4"></a>[4] [**TempFlow-GRPO:** When Timing Matters for GRPO in Flow Models](https://arxiv.org/abs/2508.04324)
+* <a name="ref5"></a>[5] [**GRPO-Guard:** Mitigating Implicit Over-Optimization in Flow Matching via Regulated Clipping](https://arxiv.org/abs/2510.22319)
+* <a name="ref6"></a>[6] [**PaCo-RL**: Advancing Reinforcement Learning for Consistent Image Generation with Pairwise Reward Modeling](https://arxiv.org/abs/2512.04784)
+* <a name="ref7"></a>[7] [**DiffusionNFT**: Online Diffusion Reinforcement with Forward Process](https://arxiv.org/abs/2509.16117)
+* <a name="ref8"></a>[8] [**DGPO**: Reinforcing Diffusion Models by Direct Group Preference Optimization](https://arxiv.org/abs/2510.08425)
+* <a name="ref9"></a>[9] [**<u>C</u>oefficients-<u>P</u>reserving <u>S</u>ampling** for Reinforcement Learning with Flow Matching](https://arxiv.org/abs/2509.05952)
+* <a name="ref10"></a>[10] [**<u>A</u>dvantage <u>W</u>eighted <u>M</u>atching**: Aligning RL with Pretraining in Diffusion Models](https://arxiv.org/abs/2509.25050)
+* <a name="ref11"></a>[11] [**Diffusion-DPO**: Diffusion Model Alignment Using Direct Preference Optimization](https://arxiv.org/abs/2311.12908)
+* <a name="ref12"></a>[12] [**TDM-R1**: Reinforcing Few-Step Diffusion Models with Non-Differentiable Reward](https://arxiv.org/abs/2510.08425)
+* <a name="ref13"></a>[13] [**CRD**: Diffusion Reinforcement Learning via Centered Reward Distillation](https://arxiv.org/abs/2603.14128)

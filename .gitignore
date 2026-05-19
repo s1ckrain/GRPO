@@ -1,0 +1,179 @@
+# ====================
+# Byte-compiled / optimized
+# ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# ====================
+# Distribution / packaging
+# ====================
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+.installed.cfg
+MANIFEST
+
+# ====================
+# Environments
+# ====================
+.env
+.venv
+venv/
+env/
+
+# ====================
+# IDE & Editor
+# ====================
+.vscode/
+.DS_Store
+
+# ====================
+# Testing & Coverage
+# ====================
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# ====================
+# Experiment tracking
+# ====================
+logs/
+swanlog/
+wandb/
+runs/
+tensorboard/
+saves/
+
+# ====================
+# Log files
+# ====================
+*.log
+*.err
+
+# ====================
+# Cache
+# ====================
+.cache
+
+# ====================
+# Output directories (use specific patterns to avoid matching folder names like ff-debug)
+# ====================
+*_out/
+*.out
+output/
+outputs/
+
+# ====================
+# Debug output files (not directories like .agents/skills/ff-debug)
+# ====================
+debug_output/
+*.debug
+
+# ====================
+# Notebooks
+# ====================
+*.ipynb
+.ipynb_checkpoints/
+
+# ====================
+# Model checkpoints & weights
+# ====================
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+*.metadata
+*.distcp
+latest_checkpointed_iteration.txt
+
+# ====================
+# AI agents / assistants (config, cache, personal notes)
+# ====================
+.cursor/
+.claude/
+.aider*
+.continue/
+.codeium/
+.windsurf/
+.codex/
+.gemini/
+.qwen/
+.cline/
+.roo/
+.devin/
+.openhands/
+.specstory/
+.copilot/
+.github/copilot/
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+.cursorrules
+.cursorignore
+.cursorindexingignore
+
+# ====================
+# Agent scratch space (temporary analysis, reports, etc.)
+# ====================
+.scratch/
+.agents/
+
+# ====================
+# Docker / Containers
+# ====================
+Dockerfile
+Dockerfile.*
+*.dockerfile
+docker-compose.yml
+docker-compose.yaml
+docker-compose.*.yml
+docker-compose.*.yaml
+.dockerignore
+docker/
+
+# ====================
+# Kubernetes / Deployment
+# ====================
+*.kubeconfig
+.kube/
+
+# ====================
+# Dataset assets (keep metadata, ignore media)
+# ====================
+
+# gitattributes in dataset
+dataset/**/.gitattributes
+
+# Image data
+dataset/**/image/
+dataset/**/image*
+dataset/**/images/
+dataset/**/images*
+dataset/**/*.jpg
+dataset/**/*.png
+dataset/**/*.jpeg
+
+# Video data
+dataset/**/video/
+dataset/**/videos/
+dataset/**/video*
+dataset/**/videos*
+dataset/**/*.mp4
+dataset/**/*.avi
+dataset/**/*.mov
+
+# ====================
+# Archives
+# ====================
+*.zip
+*.gz
+*.tar
