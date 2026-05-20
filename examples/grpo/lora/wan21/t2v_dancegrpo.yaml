@@ -1,0 +1,141 @@
+# Wan2.1 T2V × DanceGRPO style × VideoAlign reward
+#
+# Differences vs `t2v.yaml`:
+#   1. scheduler.dynamics_type: "Dance-SDE"  (instead of "Flow-SDE")
+#      -> noise schedule sigma_t = eta * sqrt(sigma_t - sigma_{t+1}), matching DanceGRPO.
+#   2. rewards: VideoAlign (KwaiVGI/VideoReward) with 1:1:1 composite weights.
+#      -> matches DanceGRPO's `inferencer.reward([path], [prompt], use_norm=True)` call exactly,
+#         except DanceGRPO official defaults to (1, 0, 0) (VQ only); we use (1, 1, 1) which
+#         matches the SAGE-GRPO codebase default and VideoAlign's built-in `Overall`.
+#
+# Environment Configuration
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 4                       # 4 GPUs
+main_process_port: 29500
+mixed_precision: "bf16"
+
+# Data Configuration
+#   VidProM short prompts (Flow-Factory's dataset/vid_prompt/train.txt ≈ 49k lines).
+#   This is the SAME source as DanceGRPO's official `assets/video_prompts.txt`
+#   (used for HunyuanVideo training), with ~98% overlap on a 1k sample check.
+#   Why not SAGE-GRPO's demo_train.csv (10k cinematic long prompts):
+#     - SAGE-GRPO trains on HunyuanVideo-1.5 (13B, 81 frames, 480p) which has the
+#       capacity to follow 200-word cinematic descriptions.
+#     - Wan2.1-1.3B at 256×5frames cannot follow that prompt length;
+#       short prompts give cleaner RL signal and faster T5 encoding.
+#   For "long-prompt OOD" stress evaluation, see dataset/sage_grpo/ (preserved).
+data:
+  dataset_dir: "dataset/vid_prompt"    # train.txt: ~49k prompts, test.txt: 1024 prompts
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: true
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 10000              # 10k unique prompts is plenty for 100 epochs × 48 unique/epoch
+  sampler_type: "auto"
+
+# Model Configuration
+model:
+  finetune_type: 'lora'
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: 'transformer'
+  target_modules: "default"
+  model_name_or_path: "/aigc/posttrain/siyuanfu/models/Wan2.1"   # local 1.3B by default
+  model_type: "wan2_t2v"
+  resume_path: null
+  resume_type: null
+
+log:
+  run_name: null                       # auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp}
+  project: "Flow-Factory"
+  logging_backend: "wandb"
+  save_dir: "saves/"                   # ckpt -> saves/{run_name}/checkpoints/checkpoint-{epoch}/
+  save_freq: 20                        # save every 20 epochs (= every 40 gradient steps)
+  save_model_only: true
+
+# Training Configuration
+train:
+  trainer_type: 'grpo'
+  advantage_aggregation: 'gdpo'
+
+  # Clipping
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+
+  # KL div
+  kl_type: 'v-based'
+  kl_beta: 0
+  ref_param_device: 'cuda'
+
+  # Sampling settings
+  resolution: 256
+  num_frames: 5    # (F - 1) mod 4 == 0
+  num_inference_steps: 10
+  guidance_scale: 5.0
+
+  # Batch and sampling
+  per_device_batch_size: 1
+  group_size: 16
+  global_std: false
+  unique_sample_num_per_epoch: 48
+  gradient_step_per_epoch: 2
+  gradient_accumulation_steps: auto
+
+  # Optimization
+  learning_rate: 1.0e-4
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  # EMA
+  ema_decay: 0.9
+  ema_update_interval: 4
+  ema_device: "cuda"
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: false
+  offload_samples_to_cpu: true
+
+  # Seed
+  seed: 42
+
+# Scheduler Configuration (DanceGRPO style)
+scheduler:
+  dynamics_type: "Dance-SDE"   # <-- DanceGRPO noise schedule
+  noise_level: 0.9
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+  flow_shift: 3.0              # 5.0 for 720P, 3.0 for 480P
+
+# Evaluation settings
+eval:
+  resolution: 480
+  num_frames: 13
+  per_device_batch_size: 1
+  seed: 42
+  guidance_scale: 5.0
+  num_inference_steps: 28
+  eval_freq: 20
+
+# Reward Model Configuration
+#   VideoAlign with 1:1:1 (matches SAGE-GRPO codebase default + VideoAlign's built-in Overall).
+#   To reproduce DanceGRPO official (VQ only): set vq_coef=1.0, mq_coef=0.0, ta_coef=0.0.
+rewards:
+  - name: "videoalign"
+    reward_model: "videoalign"
+    weight: 1.0
+    batch_size: 1                # DanceGRPO calls reward() one video at a time
+    device: "cuda"
+    dtype: bfloat16
+    # ---- extra_kwargs (passed through to VideoAlignRewardModel) -----------
+    videoalign_dir: "/aigc/posttrain/siyuanfu/VideoAlign"   # the repo with inference.py + checkpoints/
+    checkpoint_dir: null         # default = {videoalign_dir}/checkpoints
+    vq_coef: 1.0
+    mq_coef: 1.0
+    ta_coef: 1.0
+    use_norm: true               # match DanceGRPO (z-score on)
+    video_fps: 15                # matches Wan2.1 generation fps
+    return_metrics: true         # expose VQ/MQ/TA in extra_info for logging
