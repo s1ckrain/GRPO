@@ -158,6 +158,27 @@ def _load_qwen2vl_class():
     return Qwen2VLForConditionalGeneration
 
 
+def _cfg_get(config, key: str):
+    """Read a Qwen2-VL config attribute that may live either at the top level
+    (transformers < ~4.50, which VideoAlign was authored against) or under
+    `config.text_config.*` (transformers >= ~4.50, after PR #37268 standardized
+    Qwen2-VL configs as nested {text_config, vision_config}).
+
+    See https://github.com/huggingface/transformers/issues/38331.
+    """
+    val = getattr(config, key, None)
+    if val is not None:
+        return val
+    text_cfg = getattr(config, "text_config", None)
+    if text_cfg is not None:
+        val = getattr(text_cfg, key, None)
+        if val is not None:
+            return val
+    # Final fallback: return None (mirrors original `config.<key>` for unset
+    # optional fields like `pad_token_id`).
+    return None
+
+
 def _make_qwen2vl_reward_model_class():
     """
     Build `Qwen2VLRewardModelBT` lazily so that we don't hard-fail at module
@@ -166,12 +187,18 @@ def _make_qwen2vl_reward_model_class():
     Qwen2VLForConditionalGeneration = _load_qwen2vl_class()
 
     class Qwen2VLRewardModelBT(Qwen2VLForConditionalGeneration):
-        """Copied 1:1 from VideoAlign/trainer.py:59-173 so saved LoRA targets line up."""
+        """Copied 1:1 from VideoAlign/trainer.py:59-173 so saved LoRA targets line up.
+
+        The only deviation from the verbatim trainer.py is that every
+        `config.<key>` access goes through `_cfg_get` so we tolerate both the
+        old flat Qwen2VLConfig (VideoAlign's authoring env) and the new nested
+        one (transformers >= ~4.50).
+        """
 
         def __init__(self, config, output_dim=4, reward_token="last", special_token_ids=None):
             super().__init__(config)
             self.output_dim = output_dim
-            self.rm_head = nn.Linear(config.hidden_size, output_dim, bias=False)
+            self.rm_head = nn.Linear(_cfg_get(config, "hidden_size"), output_dim, bias=False)
             self.reward_token = reward_token
 
             self.special_token_ids = special_token_ids
@@ -209,14 +236,16 @@ def _make_qwen2vl_reward_model_class():
                 if pixel_values is not None:
                     pixel_values = pixel_values.type(self.visual.get_dtype())
                     image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-                    image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                    image_token_id = _cfg_get(self.config, "image_token_id")
+                    image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                     image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
                 if pixel_values_videos is not None:
                     pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
                     video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
-                    video_mask = (input_ids == self.config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                    video_token_id = _cfg_get(self.config, "video_token_id")
+                    video_mask = (input_ids == video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                     video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
@@ -240,13 +269,14 @@ def _make_qwen2vl_reward_model_class():
 
             batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
 
-            if self.config.pad_token_id is None and batch_size != 1:
+            pad_token_id = _cfg_get(self.config, "pad_token_id")
+            if pad_token_id is None and batch_size != 1:
                 raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
-            if self.config.pad_token_id is None:
+            if pad_token_id is None:
                 sequence_lengths = -1
             else:
                 if input_ids is not None:
-                    sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                    sequence_lengths = torch.eq(input_ids, pad_token_id).int().argmax(-1) - 1
                     sequence_lengths = sequence_lengths % input_ids.shape[-1]
                     sequence_lengths = sequence_lengths.to(logits.device)
                 else:
