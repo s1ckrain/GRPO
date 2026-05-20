@@ -441,8 +441,14 @@ class _VideoAlignInferencer:
             special_token_ids=special_token_ids,
             torch_dtype=dtype,
             attn_implementation=attn_impl,
-            use_cache=False,
         )
+        # `use_cache` must go through config, NOT as a from_pretrained kwarg:
+        # our subclass `__init__(self, config, output_dim=..., reward_token=...,
+        # special_token_ids=...)` doesn't declare `use_cache`, and some
+        # transformers versions forward unknown kwargs to __init__ → TypeError.
+        # Matches VideoAlign/inference.py behavior (gradient_checkpointing=False
+        # → use_cache=False) without going through the kwarg path.
+        model.config.use_cache = False
         if model_config.get("use_special_tokens", False):
             model.resize_token_embeddings(len(processor.tokenizer))
         model.to(dtype)
