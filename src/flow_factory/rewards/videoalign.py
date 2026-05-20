@@ -319,6 +319,12 @@ def _make_qwen2vl_reward_model_class():
             image_grid_thw: Optional[torch.LongTensor] = None,
             video_grid_thw: Optional[torch.LongTensor] = None,
             rope_deltas: Optional[torch.LongTensor] = None,
+            **kwargs,  # Absorb extra batch fields that newer transformers' AutoProcessor
+            # adds for multimodal inputs (e.g. `mm_token_type_ids`, `cache_position`).
+            # VideoAlign's reward path doesn't need them — visual/text embeds are
+            # already fused inside this forward via input_ids/grid_thw — so it's
+            # safe to silently drop them. Matches behavior of VideoAlign's original
+            # signature on older transformers where these fields weren't produced.
         ):
             output_attentions = (
                 output_attentions if output_attentions is not None else self.config.output_attentions
