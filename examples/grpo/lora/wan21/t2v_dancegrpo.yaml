@@ -1,128 +1,117 @@
 # Wan2.1 T2V × DanceGRPO style × VideoAlign reward
 #
-# Differences vs `t2v.yaml`:
-#   1. scheduler.dynamics_type: "Dance-SDE"  (instead of "Flow-SDE")
-#      -> noise schedule sigma_t = eta * sqrt(sigma_t - sigma_{t+1}), matching DanceGRPO.
-#   2. rewards: VideoAlign (KwaiVGI/VideoReward) with 1:1:1 composite weights.
-#      -> matches DanceGRPO's `inferencer.reward([path], [prompt], use_norm=True)` call exactly,
-#         except DanceGRPO official defaults to (1, 0, 0) (VQ only); we use (1, 1, 1) which
-#         matches the SAGE-GRPO codebase default and VideoAlign's built-in `Overall`.
+# Identical to `t2v.yaml` EXCEPT for the four lines marked `# [DIFF]`:
+#   1. num_processes: 8 -> 4              (only 4 GPUs available)
+#   2. model.model_name_or_path           (use local Wan2.1 weights)
+#   3. scheduler.dynamics_type: "Flow-SDE" -> "Dance-SDE"   (DanceGRPO noise schedule)
+#   4. rewards: CLIP + PickScore -> VideoAlign (1:1:1)      (DanceGRPO reward signal)
 #
+# Everything else (LoRA hparams, batch geometry, optimizer, EMA, eval, etc.) is
+# byte-for-byte identical to `t2v.yaml`.
+
 # Environment Configuration
-launcher: "accelerate"
-config_file: config/deepspeed/deepspeed_zero2.yaml
-num_processes: 4                       # 4 GPUs
+launcher: "accelerate"  # Options: accelerate
+config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
+num_processes: 4  # [DIFF] 4 GPUs instead of 8
 main_process_port: 29500
-mixed_precision: "bf16"
+mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
-#   VidProM short prompts (Flow-Factory's dataset/vid_prompt/train.txt ≈ 49k lines).
-#   This is the SAME source as DanceGRPO's official `assets/video_prompts.txt`
-#   (used for HunyuanVideo training), with ~98% overlap on a 1k sample check.
-#   Why not SAGE-GRPO's demo_train.csv (10k cinematic long prompts):
-#     - SAGE-GRPO trains on HunyuanVideo-1.5 (13B, 81 frames, 480p) which has the
-#       capacity to follow 200-word cinematic descriptions.
-#     - Wan2.1-1.3B at 256×5frames cannot follow that prompt length;
-#       short prompts give cleaner RL signal and faster T5 encoding.
-#   For "long-prompt OOD" stress evaluation, see dataset/sage_grpo/ (preserved).
 data:
-  dataset_dir: "dataset/vid_prompt"    # train.txt: ~49k prompts, test.txt: 1024 prompts
-  preprocessing_batch_size: 8
-  dataloader_num_workers: 16
-  force_reprocess: true
-  cache_dir: "~/.cache/flow_factory/datasets"
-  max_dataset_size: 10000              # 10k unique prompts is plenty for 100 epochs × 48 unique/epoch
-  sampler_type: "auto"
+  dataset_dir: "dataset/pickscore"  # Path to dataset folder
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: true  # Force reprocessing of the dataset
+  cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
+  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
 
 # Model Configuration
 model:
-  finetune_type: 'lora'
-  lora_rank: 64
-  lora_alpha: 128
-  target_components: 'transformer'
-  target_modules: "default"
-  model_name_or_path: "/aigc/posttrain/siyuanfu/models/Wan2.1"   # local 1.3B by default
-  model_type: "wan2_t2v"
-  resume_path: null
-  resume_type: null
+  finetune_type: 'lora' # Options: full, lora
+  lora_rank : 64
+  lora_alpha : 128
+  target_components: 'transformer' # Options: transformer (Wan2.1 & Wan2.2), transformer_2 (Wan2.2)
+  target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
+  model_name_or_path: "/aigc/posttrain/siyuanfu/models/Wan2.1"  # [DIFF] local Wan2.1 weights
+  model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
+  resume_path: null # Path to load previous checkpoint/lora adapter
+  resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
 
 log:
-  run_name: null                       # auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp}
-  project: "Flow-Factory"
-  logging_backend: "wandb"
-  save_dir: "saves/"                   # ckpt -> saves/{run_name}/checkpoints/checkpoint-{epoch}/
-  save_freq: 20                        # save every 20 epochs (= every 40 gradient steps)
-  save_model_only: true
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
 
 # Training Configuration
 train:
-  trainer_type: 'grpo'
-  advantage_aggregation: 'gdpo'
-
+  # Trainer settings
+  trainer_type: 'grpo' # Options: 'grpo', 'nft', 'awm'
+  advantage_aggregation: 'gdpo' # Options: 'sum', 'gdpo'
   # Clipping
-  clip_range: 1.0e-4
-  adv_clip_range: 5.0
-
+  clip_range: 1.0e-4  # PPO/GRPO clipping range
+  adv_clip_range: 5.0  # Advantage clipping range
   # KL div
-  kl_type: 'v-based'
-  kl_beta: 0
-  ref_param_device: 'cuda'
+  kl_type: 'v-based' # Options: 'x-based', 'v-based'
+  kl_beta: 0 # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  ref_param_device: 'cuda' # Options: cpu, cuda
 
   # Sampling settings
-  resolution: 256
-  num_frames: 5    # (F - 1) mod 4 == 0
-  num_inference_steps: 10
-  guidance_scale: 5.0
-
+  resolution: 256  # Can be int or [height, width]
+  num_frames: 5 # (F - 1) mod 4 == 0
+  num_inference_steps: 10  # Number of timesteps
+  guidance_scale: 5.0  # Guidance scale for sampling
+ 
   # Batch and sampling
-  per_device_batch_size: 1
-  group_size: 16
-  global_std: false
-  unique_sample_num_per_epoch: 48
-  gradient_step_per_epoch: 2
-  gradient_accumulation_steps: auto
-
+  per_device_batch_size: 1  # Batch size per device
+  group_size: 16  # Group size for GRPO sampling
+  global_std: false  # Use global std for advantage normalization
+  unique_sample_num_per_epoch: 48  # Unique samples per group
+  gradient_step_per_epoch: 2  # Gradient steps per epoch
+  gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
+  
   # Optimization
-  learning_rate: 1.0e-4
-  adam_weight_decay: 1.0e-4
-  adam_betas: [0.9, 0.999]
-  adam_epsilon: 1.0e-8
-  max_grad_norm: 1.0
+  learning_rate: 1.0e-4  # Initial learning rate
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
 
   # EMA
-  ema_decay: 0.9
-  ema_update_interval: 4
-  ema_device: "cuda"
+  ema_decay: 0.9  # EMA decay rate (0 to disable)
+  ema_update_interval: 4  # EMA update interval (in epochs)
+  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
 
   # Gradient checkpointing
-  enable_gradient_checkpointing: false
-  offload_samples_to_cpu: true
+  enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
+  offload_samples_to_cpu: true  # Required for video models: per-sample tensors are GB-scale; without offload, sample()/optimize() OOMs at num_batches_per_epoch > 1.
 
   # Seed
-  seed: 42
+  seed: 42  # Random seed
 
-# Scheduler Configuration (DanceGRPO style)
+# Scheduler Configuration
 scheduler:
-  dynamics_type: "Dance-SDE"   # <-- DanceGRPO noise schedule
-  noise_level: 0.9
-  num_sde_steps: 1
-  sde_steps: [1, 2, 3]
-  seed: 42
-  flow_shift: 3.0              # 5.0 for 720P, 3.0 for 480P
+  dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule (vs. Flow-SDE in t2v.yaml)
+  noise_level: 0.9  # Noise level for sampling
+  num_sde_steps: 1  # Number of noise steps
+  sde_steps: [1, 2, 3]  # Custom noise window, noise steps are randomly selected from this list during training
+  seed: 42  # Scheduler seed (for noise step selection)
+  flow_shift: 3.0 # 5.0 for 720P, 3.0 for 480P (from WanPipeline docstring)
 
 # Evaluation settings
 eval:
-  resolution: 480
-  num_frames: 13
-  per_device_batch_size: 1
-  seed: 42
-  guidance_scale: 5.0
-  num_inference_steps: 28
-  eval_freq: 20
+  resolution: 480  # Evaluation resolution
+  num_frames: 13 # Evaluation frames
+  per_device_batch_size: 1  # Eval batch size
+  seed: 42  # Eval seed (defaults to training seed)
+  guidance_scale: 5.0  # Guidance scale for sampling
+  num_inference_steps: 28  # Number of eval timesteps
+  eval_freq: 20  # Eval frequency in epochs (0 to disable)
 
-# Reward Model Configuration
-#   VideoAlign with 1:1:1 (matches SAGE-GRPO codebase default + VideoAlign's built-in Overall).
-#   To reproduce DanceGRPO official (VQ only): set vq_coef=1.0, mq_coef=0.0, ta_coef=0.0.
+# Reward Model Configuration  # [DIFF] VideoAlign (1:1:1) instead of CLIP + PickScore
 rewards:
   - name: "videoalign"
     reward_model: "videoalign"
@@ -139,3 +128,11 @@ rewards:
     use_norm: true               # match DanceGRPO (z-score on)
     video_fps: 15                # matches Wan2.1 generation fps
     return_metrics: true         # expose VQ/MQ/TA in extra_info for logging
+
+# Optional Evaluation Reward Models
+# eval_rewards:
+#   - name: "text_alignment_2"
+#     reward_model: "CLIP"
+#     batch_size: 16
+#     device: "cuda"
+#     dtype: bfloat16
