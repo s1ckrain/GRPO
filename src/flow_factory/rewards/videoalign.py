@@ -63,6 +63,7 @@ import glob
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from collections.abc import Mapping
@@ -179,6 +180,102 @@ def _cfg_get(config, key: str):
     return None
 
 
+# ----------------------------------------------------------------------------
+# Legacy -> new state_dict key translation (transformers Qwen2-VL restructure).
+#
+# transformers >= ~4.50 restructured Qwen2-VL: visual moved from top-level
+# `self.visual` to `self.model.visual`, and the text submodel moved from
+# `self.model` (a Qwen2Model) to `self.model.language_model` (a Qwen2VLTextModel).
+# `from_pretrained()` auto-translates HF-hub legacy ckpts using this regex:
+#
+#   _checkpoint_conversion_mapping = {
+#       "^visual": "model.visual",
+#       r"^model(?!\.(language_model|visual))": "model.language_model",
+#   }
+#
+# (https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/
+#  models/qwen2_vl/modeling_qwen2_vl.py#L1222)
+#
+# But we DON'T go through `from_pretrained` for the VideoAlign LoRA+non_lora
+# files (we load them with torch.load / safetensors.load and merge manually),
+# so we have to apply the same mapping ourselves. We also handle the PEFT
+# `base_model.model.<key>` prefix.
+# ----------------------------------------------------------------------------
+
+
+_QWEN2VL_LEGACY_TO_NEW_REGEX = [
+    (re.compile(r"^visual"), "model.visual"),
+    (re.compile(r"^model(?!\.(language_model|visual))"), "model.language_model"),
+]
+
+_PEFT_PREFIX = "base_model.model."
+
+
+def _has_new_qwen2vl_layout(model: nn.Module) -> bool:
+    """True iff we're on transformers >= ~4.50 where visual+text are nested
+    under `model.model.{visual, language_model}` instead of being at the top
+    level. Determines whether legacy state_dicts need translation and whether
+    forward() should route through the new nested submodules.
+    """
+    inner = getattr(model, "model", None)
+    return inner is not None and hasattr(inner, "visual") and hasattr(inner, "language_model")
+
+
+def _translate_legacy_qwen2vl_keys(
+    state_dict: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Apply Qwen2VL's checkpoint_conversion_mapping manually so we can load
+    VideoAlign-saved (legacy-flat) state_dicts into the new nested model.
+
+    Handles both bare keys (`visual.patch_embed.proj.weight`) and PEFT-prefixed
+    keys (`base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight`).
+    Keys that don't match any pattern (e.g. `lm_head.weight`, `rm_head.weight`)
+    are left untouched, matching the upstream regex semantics.
+    """
+    new_state_dict: Dict[str, torch.Tensor] = {}
+    for key, val in state_dict.items():
+        if key.startswith(_PEFT_PREFIX):
+            prefix = _PEFT_PREFIX
+            tail = key[len(_PEFT_PREFIX):]
+        else:
+            prefix = ""
+            tail = key
+        for pattern, repl in _QWEN2VL_LEGACY_TO_NEW_REGEX:
+            new_tail, count = pattern.subn(repl, tail, count=1)
+            if count:
+                tail = new_tail
+                break
+        new_state_dict[prefix + tail] = val
+    return new_state_dict
+
+
+def _get_visual(model: nn.Module) -> nn.Module:
+    """Resolve the visual submodule across transformers versions."""
+    if hasattr(model, "visual"):
+        return model.visual
+    return model.model.visual
+
+
+def _get_text_submodel(model: nn.Module) -> nn.Module:
+    """Resolve the text submodel across transformers versions.
+
+    Old layout: `self.model` IS the Qwen2Model (has `embed_tokens`).
+    New layout: `self.model` is Qwen2VLModel; text is at `self.model.language_model`.
+    """
+    if hasattr(model.model, "embed_tokens"):
+        return model.model
+    return model.model.language_model
+
+
+def _visual_dtype(visual: nn.Module) -> torch.dtype:
+    """Resolve visual dtype across transformers versions (old: get_dtype(), new: .dtype)."""
+    if hasattr(visual, "get_dtype"):
+        return visual.get_dtype()
+    if hasattr(visual, "dtype"):
+        return visual.dtype
+    return next(visual.parameters()).dtype
+
+
 def _make_qwen2vl_reward_model_class():
     """
     Build `Qwen2VLRewardModelBT` lazily so that we don't hard-fail at module
@@ -231,19 +328,25 @@ def _make_qwen2vl_reward_model_class():
             )
             return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+            # Resolve visual + text submodules across transformers versions:
+            #   old: self.visual, self.model (Qwen2Model)
+            #   new: self.model.visual, self.model.language_model (Qwen2VLTextModel)
+            visual = _get_visual(self)
+            text_model = _get_text_submodel(self)
+
             if inputs_embeds is None:
-                inputs_embeds = self.model.embed_tokens(input_ids)
+                inputs_embeds = text_model.embed_tokens(input_ids)
                 if pixel_values is not None:
-                    pixel_values = pixel_values.type(self.visual.get_dtype())
-                    image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                    pixel_values = pixel_values.type(_visual_dtype(visual))
+                    image_embeds = visual(pixel_values, grid_thw=image_grid_thw)
                     image_token_id = _cfg_get(self.config, "image_token_id")
                     image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                     image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                     inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
                 if pixel_values_videos is not None:
-                    pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
-                    video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                    pixel_values_videos = pixel_values_videos.type(_visual_dtype(visual))
+                    video_embeds = visual(pixel_values_videos, grid_thw=video_grid_thw)
                     video_token_id = _cfg_get(self.config, "video_token_id")
                     video_mask = (input_ids == video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                     video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -252,7 +355,7 @@ def _make_qwen2vl_reward_model_class():
                 if attention_mask is not None:
                     attention_mask = attention_mask.to(inputs_embeds.device)
 
-            outputs = self.model(
+            outputs = text_model(
                 input_ids=None,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
@@ -354,8 +457,18 @@ def _load_videoalign_checkpoint(
     lora_ckpt = os.path.join(checkpoint_path, "adapter_model.safetensors")
     non_lora_ckpt = os.path.join(checkpoint_path, "non_lora_state_dict.pth")
 
+    # Translate legacy-flat keys to the new nested layout iff we're on the
+    # restructured transformers (>= ~4.50). On the old transformers (VideoAlign's
+    # authoring env), `_translate_legacy_qwen2vl_keys` is a no-op because the
+    # underlying PeftModel-wrapped model already uses the legacy key shape.
+    needs_translation = _has_new_qwen2vl_layout(
+        model.base_model.model if hasattr(model, "base_model") else model
+    )
+
     if os.path.exists(full_ckpt):
         model_state_dict = torch.load(full_ckpt, map_location="cpu")
+        if needs_translation:
+            model_state_dict = _translate_legacy_qwen2vl_keys(model_state_dict)
         model.load_state_dict(model_state_dict)
     else:
         lora_state_dict = safetensors.torch.load_file(lora_ckpt)
@@ -363,6 +476,9 @@ def _load_videoalign_checkpoint(
         lora_state_dict = _insert_adapter_name_into_state_dict(
             lora_state_dict, adapter_name="default", parameter_prefix="lora_"
         )
+        if needs_translation:
+            lora_state_dict = _translate_legacy_qwen2vl_keys(lora_state_dict)
+            non_lora_state_dict = _translate_legacy_qwen2vl_keys(non_lora_state_dict)
         model_state_dict = model.state_dict()
         model_state_dict.update(non_lora_state_dict)
         model_state_dict.update(lora_state_dict)
