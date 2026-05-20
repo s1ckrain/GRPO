@@ -935,6 +935,16 @@ class VideoAlignRewardModel(PointwiseRewardModel):
 
         rewards = torch.tensor(composite_list, dtype=torch.float32, device=device)
 
+        # Flow-Factory does not consume RewardModelOutput.extra_info, and it
+        # also does not register trackers via accelerator.init_trackers — it
+        # uses a stand-alone wandb.init() (see flow_factory/logger/wandb.py).
+        # So we push per-dim VQ/MQ/TA stats to the active wandb run directly
+        # via the global `wandb` handle. wandb's internal step auto-increments
+        # per call; the resulting curves are aligned by call-order, not by
+        # trainer epoch — good enough to watch dim-level trends alongside the
+        # composite curve.
+        self._maybe_log_dim_metrics(vq_list, mq_list, ta_list, composite_list)
+
         extra_info = None
         if self.return_metrics:
             extra_info = {
@@ -950,3 +960,59 @@ class VideoAlignRewardModel(PointwiseRewardModel):
             }
 
         return RewardModelOutput(rewards=rewards, extra_info=extra_info)
+
+    def _maybe_log_dim_metrics(
+        self,
+        vq_list: List[float],
+        mq_list: List[float],
+        ta_list: List[float],
+        composite_list: List[float],
+    ) -> None:
+        """Push VQ / MQ / TA per-call batch means to the active wandb run.
+
+        Flow-Factory uses a stand-alone ``wandb.init()`` (not
+        ``accelerator.init_trackers``), so we must call the global ``wandb``
+        handle rather than ``self.accelerator.log()``.
+
+        Silent no-op when:
+          * ``self.accelerator`` is missing,
+          * not on the main process,
+          * ``wandb`` is not installed,
+          * no active wandb run (``wandb.run is None``),
+          * any other error is raised (we never want logging to block training).
+        """
+        accel = getattr(self, "accelerator", None)
+        if accel is None:
+            return
+        if not getattr(accel, "is_main_process", True):
+            return
+        if not vq_list:
+            return
+        try:
+            import wandb  # local import keeps wandb fully optional
+        except ImportError:
+            return
+        if wandb.run is None:
+            return
+        try:
+            vq_t = torch.tensor(vq_list, dtype=torch.float32)
+            mq_t = torch.tensor(mq_list, dtype=torch.float32)
+            ta_t = torch.tensor(ta_list, dtype=torch.float32)
+            comp_t = torch.tensor(composite_list, dtype=torch.float32)
+            payload = {
+                "reward/VQ_mean": float(vq_t.mean().item()),
+                "reward/VQ_std":  float(vq_t.std(unbiased=False).item()),
+                "reward/MQ_mean": float(mq_t.mean().item()),
+                "reward/MQ_std":  float(mq_t.std(unbiased=False).item()),
+                "reward/TA_mean": float(ta_t.mean().item()),
+                "reward/TA_std":  float(ta_t.std(unbiased=False).item()),
+                "reward/composite_local_mean": float(comp_t.mean().item()),
+            }
+            # No explicit step: wandb uses its internal monotonic counter,
+            # which lives in a separate "axis" from trainer.log_data() (which
+            # passes its own explicit step). The two sets of curves therefore
+            # share the wandb run but not the x-axis — that's fine for
+            # eyeballing reward/* dim-level trends.
+            wandb.log(payload)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"[VideoAlign] dim-metric log skipped: {e}")
