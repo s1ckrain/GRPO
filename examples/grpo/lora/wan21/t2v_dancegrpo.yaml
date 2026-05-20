@@ -1,14 +1,30 @@
 # Wan2.1 T2V × DanceGRPO style × VideoAlign reward
 #
-# Identical to `t2v.yaml` EXCEPT for the five lines marked `# [DIFF]`:
-#   1. num_processes: 8 -> 4              (only 4 GPUs available)
-#   2. model.model_name_or_path           (use local Wan2.1 weights)
-#   3. data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts vs. T2I)
-#   4. scheduler.dynamics_type: "Flow-SDE" -> "Dance-SDE"   (DanceGRPO noise schedule)
-#   5. rewards: CLIP + PickScore -> VideoAlign (1:1:1)      (DanceGRPO reward signal)
+# Strictly aligned with DanceGRPO official `finetune_wan_2_1_grpo.sh`:
+#   group_size            = num_generations            = 12
+#   unique prompts / step = train_batch_size × gas × world  = 2 × 24 × 8 = 384
+#   rollouts / step       = unique prompts × group_size      = 4608
+#   total gradient steps  = max_train_steps                  = 1000  (DanceGRPO)
 #
-# Everything else (LoRA hparams, batch geometry, optimizer, EMA, eval, etc.) is
-# byte-for-byte identical to `t2v.yaml`.
+# Our deviations (forced by hardware / repro scope):
+#   - num_processes:        8  -> 4   (only 4 GPUs available)
+#   - max_epochs:           -- -> 500 (1000 / 2; we halve the schedule)
+#   - model.model_name_or_path        (local Wan2.1 weights)
+#   - data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts vs. T2I)
+#   - scheduler.dynamics_type: Flow-SDE -> Dance-SDE
+#   - rewards: CLIP + PickScore -> VideoAlign (1:1:1)
+#
+# Per-step batch GEOMETRY is identical to DanceGRPO:
+#   group_size                   : 12
+#   unique_sample_num_per_epoch  : 384  (= unique prompts per gradient step)
+#   gradient_step_per_epoch      : 1    (1 epoch == 1 DanceGRPO step)
+#   gradient_accumulation_steps  : auto -> (384 × 12) / (4 × 1) / 1 = 1152
+#     => each grad step uses 4608 video samples (same as DanceGRPO).
+#
+# Because we run on 4 GPU instead of 8, each GPU does 2x the sequential work
+# per step, so wall-clock per step is ~2x DanceGRPO. With max_epochs=500
+# (half schedule) total wall-clock ends up ~similar to DanceGRPO's 1000 step
+# 8-GPU run, scaled by the 14B vs 1.3B model size.
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
@@ -66,13 +82,13 @@ train:
   num_inference_steps: 10  # Number of timesteps
   guidance_scale: 5.0  # Guidance scale for sampling
  
-  # Batch and sampling
-  per_device_batch_size: 1  # Batch size per device
-  group_size: 16  # Group size for GRPO sampling
-  global_std: false  # Use global std for advantage normalization
-  unique_sample_num_per_epoch: 48  # Unique samples per group
-  gradient_step_per_epoch: 2  # Gradient steps per epoch
-  gradient_accumulation_steps: auto  # Options: auto, or positive integer. When set, `gradient_step_per_epoch` is ignored.
+  # Batch and sampling  [DIFF] strictly aligned with DanceGRPO per-step geometry
+  per_device_batch_size: 1                # video-scale fwd granularity (mem limit)
+  group_size: 12                          # = DanceGRPO `num_generations`
+  global_std: false                       # group-normalize per prompt (DanceGRPO uses per-group mean/std)
+  unique_sample_num_per_epoch: 384        # = DanceGRPO unique prompts per gradient step (2 × 24 × 8)
+  gradient_step_per_epoch: 1              # 1 epoch = 1 DanceGRPO `optimizer.step()`
+  gradient_accumulation_steps: auto       # auto -> 1152, => 4608 video / step (same as DanceGRPO)
   
   # Optimization
   learning_rate: 1.0e-4  # Initial learning rate
@@ -92,6 +108,14 @@ train:
 
   # Seed
   seed: 42  # Random seed
+
+  # Training duration cap.  [DIFF] half of DanceGRPO's 1000 step schedule.
+  # gradient_step_per_epoch=1 → 1 epoch == 1 DanceGRPO `optimizer.step()`.
+  #   DanceGRPO official (Wan2.1):  1000 step  =>  1000 epochs equivalent
+  #   Ours (4 GPU, halved):          500 step  =>     500 epochs
+  # Each epoch processes 384 unique prompts × 12 rollouts = 4608 video gens,
+  # numerically identical to one DanceGRPO step. Resume if reward still rising.
+  max_epochs: 500
 
 # Scheduler Configuration
 scheduler:
