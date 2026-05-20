@@ -1,30 +1,36 @@
-# Wan2.1 T2V × DanceGRPO style × VideoAlign reward
+# Wan2.1 T2V × DanceGRPO baseline reproduction × VideoAlign reward
 #
-# Strictly aligned with DanceGRPO official `finetune_wan_2_1_grpo.sh`:
-#   group_size            = num_generations            = 12
-#   unique prompts / step = train_batch_size × gas × world  = 2 × 24 × 8 = 384
-#   rollouts / step       = unique prompts × group_size      = 4608
-#   total gradient steps  = max_train_steps                  = 1000  (DanceGRPO)
+# Model: Wan2.1-T2V-1.3B  (SAME as DanceGRPO `finetune_wan_2_1_grpo.sh`).
 #
-# Our deviations (forced by hardware / repro scope):
+# DanceGRPO Wan2.1 1.3B official per-step geometry:
+#   group_size (num_generations) = 12
+#   per-step rollouts            = 2 × 12 × 8 × 24 = 4608 video
+#   total grad steps             = 1000
+#
+# Our adaptation (4 GPU, LoRA, ~3-4 day budget):
+#   group_size                   : 12   = DanceGRPO Wan2.1 (preserve group-norm)
+#   per_device_batch_size        : 1
+#   unique_sample_num_per_epoch  : 32   = 8 prompts × 4 GPU  (cut from 384)
+#   gradient_step_per_epoch      : 1    (1 epoch == 1 optimizer.step())
+#   gradient_accumulation_steps  : auto -> (32 × 12) / (4 × 1) / 1 = 96
+#     => each grad step uses 384 video samples (matches Flow-Factory t2v.yaml
+#        per-step throughput; per-prompt group still 12 like DanceGRPO)
+#   max_epochs                   : 1500 (DanceGRPO 1000 step × 1.5 for safety)
+#
+# Tradeoffs vs DanceGRPO 1.3B official:
+#   - Per-step rollouts:  4608 -> 384   (12x smaller effective batch / step)
+#   - Per-prompt group:     12 -> 12    (UNCHANGED — preserves GRPO group signal)
+#   - Total backward:     1000 -> 1500  (compensate small batch with more steps)
+#
+# Wall-clock budget (4 GPU, 1.3B model):
+#   ~3.3 min / step × 1500 step ≈ 82 hours ≈ 3.4 days
+#
+# Other deviations from `t2v.yaml`:
 #   - num_processes:        8  -> 4   (only 4 GPUs available)
-#   - max_epochs:           -- -> 500 (1000 / 2; we halve the schedule)
-#   - model.model_name_or_path        (local Wan2.1 weights)
-#   - data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts vs. T2I)
+#   - model.model_name_or_path        (local Wan2.1-1.3B weights)
+#   - data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts)
 #   - scheduler.dynamics_type: Flow-SDE -> Dance-SDE
 #   - rewards: CLIP + PickScore -> VideoAlign (1:1:1)
-#
-# Per-step batch GEOMETRY is identical to DanceGRPO:
-#   group_size                   : 12
-#   unique_sample_num_per_epoch  : 384  (= unique prompts per gradient step)
-#   gradient_step_per_epoch      : 1    (1 epoch == 1 DanceGRPO step)
-#   gradient_accumulation_steps  : auto -> (384 × 12) / (4 × 1) / 1 = 1152
-#     => each grad step uses 4608 video samples (same as DanceGRPO).
-#
-# Because we run on 4 GPU instead of 8, each GPU does 2x the sequential work
-# per step, so wall-clock per step is ~2x DanceGRPO. With max_epochs=500
-# (half schedule) total wall-clock ends up ~similar to DanceGRPO's 1000 step
-# 8-GPU run, scaled by the 14B vs 1.3B model size.
 
 # Environment Configuration
 launcher: "accelerate"  # Options: accelerate
@@ -60,7 +66,7 @@ log:
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"  # Directory to save model checkpoints and logs
-  save_freq: 20  # Save frequency in epochs (0 to disable)
+  save_freq: 100  # [DIFF] 20 -> 100 (15 ckpts over 1500 step, avoids disk bloat)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
 
 # Training Configuration
@@ -82,13 +88,13 @@ train:
   num_inference_steps: 10  # Number of timesteps
   guidance_scale: 5.0  # Guidance scale for sampling
  
-  # Batch and sampling  [DIFF] strictly aligned with DanceGRPO per-step geometry
-  per_device_batch_size: 1                # video-scale fwd granularity (mem limit)
-  group_size: 12                          # = DanceGRPO `num_generations`
-  global_std: false                       # group-normalize per prompt (DanceGRPO uses per-group mean/std)
-  unique_sample_num_per_epoch: 384        # = DanceGRPO unique prompts per gradient step (2 × 24 × 8)
-  gradient_step_per_epoch: 1              # 1 epoch = 1 DanceGRPO `optimizer.step()`
-  gradient_accumulation_steps: auto       # auto -> 1152, => 4608 video / step (same as DanceGRPO)
+  # Batch and sampling  [DIFF] DanceGRPO group_size + reduced unique prompts for 4 GPU
+  per_device_batch_size: 1                # video-scale fwd granularity
+  group_size: 12                          # = DanceGRPO Wan2.1 `num_generations` (per-prompt group unchanged)
+  global_std: false                       # group-normalize per prompt (DanceGRPO style)
+  unique_sample_num_per_epoch: 32         # 8 prompts × 4 GPU  (cut from DanceGRPO's 384 to fit budget)
+  gradient_step_per_epoch: 1              # 1 epoch = 1 optimizer.step()
+  gradient_accumulation_steps: auto       # auto -> (32×12)/(4×1)/1 = 96  =>  384 video / step
   
   # Optimization
   learning_rate: 1.0e-4  # Initial learning rate
@@ -99,7 +105,7 @@ train:
 
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
-  ema_update_interval: 4  # EMA update interval (in epochs)
+  ema_update_interval: 10  # [DIFF] 4 -> 10 (150 EMA updates over 1500 step)
   ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
 
   # Gradient checkpointing
@@ -109,13 +115,16 @@ train:
   # Seed
   seed: 42  # Random seed
 
-  # Training duration cap.  [DIFF] half of DanceGRPO's 1000 step schedule.
-  # gradient_step_per_epoch=1 → 1 epoch == 1 DanceGRPO `optimizer.step()`.
-  #   DanceGRPO official (Wan2.1):  1000 step  =>  1000 epochs equivalent
-  #   Ours (4 GPU, halved):          500 step  =>     500 epochs
-  # Each epoch processes 384 unique prompts × 12 rollouts = 4608 video gens,
-  # numerically identical to one DanceGRPO step. Resume if reward still rising.
-  max_epochs: 500
+  # Training duration cap.  [DIFF] DanceGRPO 1000 step × 1.5 for safety.
+  # gradient_step_per_epoch=1 → 1 epoch == 1 optimizer.step().
+  #   DanceGRPO official (Wan2.1 1.3B):   1000 step  (per-step 4608 video)
+  #   Ours (4 GPU, 1.3B):                 1500 step  (per-step  384 video)
+  #     => total rollouts ≈ 0.58M (vs DanceGRPO 4.6M)
+  #     => total backward 1500 (1.5x DanceGRPO, compensates smaller per-step batch)
+  # Each epoch processes 32 unique prompts × 12 rollouts = 384 video gens.
+  # First reward-up signal usually appears around step 50-150.
+  # If reward still rising at 1500, resume and bump max_epochs.
+  max_epochs: 1500
 
 # Scheduler Configuration
 scheduler:
@@ -134,7 +143,7 @@ eval:
   seed: 42  # Eval seed (defaults to training seed)
   guidance_scale: 5.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
-  eval_freq: 20  # Eval frequency in epochs (0 to disable)
+  eval_freq: 100  # [DIFF] 20 -> 100 (15 evals over 1500 step; eval is expensive)
 
 # Reward Model Configuration  # [DIFF] VideoAlign (1:1:1) instead of CLIP + PickScore
 rewards:
