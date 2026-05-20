@@ -1,10 +1,11 @@
 # Wan2.1 T2V × DanceGRPO style × VideoAlign reward
 #
-# Identical to `t2v.yaml` EXCEPT for the four lines marked `# [DIFF]`:
+# Identical to `t2v.yaml` EXCEPT for the five lines marked `# [DIFF]`:
 #   1. num_processes: 8 -> 4              (only 4 GPUs available)
 #   2. model.model_name_or_path           (use local Wan2.1 weights)
-#   3. scheduler.dynamics_type: "Flow-SDE" -> "Dance-SDE"   (DanceGRPO noise schedule)
-#   4. rewards: CLIP + PickScore -> VideoAlign (1:1:1)      (DanceGRPO reward signal)
+#   3. data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts vs. T2I)
+#   4. scheduler.dynamics_type: "Flow-SDE" -> "Dance-SDE"   (DanceGRPO noise schedule)
+#   5. rewards: CLIP + PickScore -> VideoAlign (1:1:1)      (DanceGRPO reward signal)
 #
 # Everything else (LoRA hparams, batch geometry, optimizer, EMA, eval, etc.) is
 # byte-for-byte identical to `t2v.yaml`.
@@ -18,7 +19,7 @@ mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/pickscore"  # Path to dataset folder
+  dataset_dir: "dataset/vid_prompt"  # DanceGRPO official 50k video prompts (vs. pickscore = T2I-only)
   preprocessing_batch_size: 8  # Batch size for preprocessing
   dataloader_num_workers: 16  # Number of workers for DataLoader
   force_reprocess: true  # Force reprocessing of the dataset
