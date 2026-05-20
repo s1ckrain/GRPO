@@ -276,6 +276,33 @@ def _visual_dtype(visual: nn.Module) -> torch.dtype:
     return next(visual.parameters()).dtype
 
 
+def _unwrap_visual_output(out) -> torch.Tensor:
+    """Normalize the Qwen2-VL visual forward output to a plain tensor.
+
+    Old transformers (VideoAlign's authoring env): returns torch.Tensor directly.
+    Some newer transformers wrap it in `BaseModelOutputWithPooling` (an
+    `ModelOutput` dataclass with `last_hidden_state` / `pooler_output`), or in
+    a plain tuple. We always want the flattened patch embeddings tensor.
+    """
+    if torch.is_tensor(out):
+        return out
+    # ModelOutput / BaseModelOutputWithPooling case
+    if hasattr(out, "last_hidden_state"):
+        return out.last_hidden_state
+    # Some variants name it differently
+    for key in ("hidden_states", "image_embeds", "video_embeds"):
+        val = getattr(out, key, None)
+        if torch.is_tensor(val):
+            return val
+    # Plain tuple (e.g. return_dict=False path)
+    if isinstance(out, (tuple, list)) and len(out) > 0 and torch.is_tensor(out[0]):
+        return out[0]
+    raise TypeError(
+        f"Unexpected Qwen2-VL visual forward output type: {type(out).__name__}. "
+        "Cannot extract embedding tensor."
+    )
+
+
 def _make_qwen2vl_reward_model_class():
     """
     Build `Qwen2VLRewardModelBT` lazily so that we don't hard-fail at module
@@ -344,7 +371,9 @@ def _make_qwen2vl_reward_model_class():
                 inputs_embeds = text_model.embed_tokens(input_ids)
                 if pixel_values is not None:
                     pixel_values = pixel_values.type(_visual_dtype(visual))
-                    image_embeds = visual(pixel_values, grid_thw=image_grid_thw)
+                    image_embeds = _unwrap_visual_output(
+                        visual(pixel_values, grid_thw=image_grid_thw)
+                    )
                     image_token_id = _cfg_get(self.config, "image_token_id")
                     image_mask = (input_ids == image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                     image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -352,7 +381,9 @@ def _make_qwen2vl_reward_model_class():
 
                 if pixel_values_videos is not None:
                     pixel_values_videos = pixel_values_videos.type(_visual_dtype(visual))
-                    video_embeds = visual(pixel_values_videos, grid_thw=video_grid_thw)
+                    video_embeds = _unwrap_visual_output(
+                        visual(pixel_values_videos, grid_thw=video_grid_thw)
+                    )
                     video_token_id = _cfg_get(self.config, "video_token_id")
                     video_mask = (input_ids == video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
                     video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
