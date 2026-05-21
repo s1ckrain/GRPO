@@ -938,11 +938,10 @@ class VideoAlignRewardModel(PointwiseRewardModel):
         # Flow-Factory does not consume RewardModelOutput.extra_info, and it
         # also does not register trackers via accelerator.init_trackers — it
         # uses a stand-alone wandb.init() (see flow_factory/logger/wandb.py).
-        # So we push per-dim VQ/MQ/TA stats to the active wandb run directly
-        # via the global `wandb` handle. wandb's internal step auto-increments
-        # per call; the resulting curves are aligned by call-order, not by
-        # trainer epoch — good enough to watch dim-level trends alongside the
-        # composite curve.
+        # We push per-dim VQ/MQ/TA stats to the active wandb run using a
+        # dedicated step axis (`reward/_call`) registered via
+        # wandb.define_metric, so this never collides with the trainer's
+        # explicit step on `train/*` and `eval/*` panels.
         self._maybe_log_dim_metrics(vq_list, mq_list, ta_list, composite_list)
 
         extra_info = None
@@ -970,9 +969,13 @@ class VideoAlignRewardModel(PointwiseRewardModel):
     ) -> None:
         """Push VQ / MQ / TA per-call batch means to the active wandb run.
 
-        Flow-Factory uses a stand-alone ``wandb.init()`` (not
-        ``accelerator.init_trackers``), so we must call the global ``wandb``
-        handle rather than ``self.accelerator.log()``.
+        Uses an INDEPENDENT step axis (``reward/_call``) registered via
+        ``wandb.define_metric`` on first call, so this never collides with the
+        trainer's explicit step on ``train/*`` and ``eval/*`` panels.
+
+        Without this, naive ``wandb.log(payload)`` here would auto-increment
+        wandb's internal step counter past the trainer's explicit step and
+        cause wandb to silently drop all subsequent ``train/*`` logs.
 
         Silent no-op when:
           * ``self.accelerator`` is missing,
@@ -995,11 +998,22 @@ class VideoAlignRewardModel(PointwiseRewardModel):
         if wandb.run is None:
             return
         try:
+            # Lazy one-time registration of the independent step axis so that
+            # `reward/*` panels do NOT advance wandb's main `_step` counter
+            # (which would block `train/*` logs that use explicit step).
+            if not getattr(self, "_reward_metric_registered", False):
+                wandb.define_metric("reward/_call")
+                wandb.define_metric("reward/*", step_metric="reward/_call")
+                self._reward_metric_registered = True
+                self._reward_call_counter = 0
+
+            self._reward_call_counter += 1
             vq_t = torch.tensor(vq_list, dtype=torch.float32)
             mq_t = torch.tensor(mq_list, dtype=torch.float32)
             ta_t = torch.tensor(ta_list, dtype=torch.float32)
             comp_t = torch.tensor(composite_list, dtype=torch.float32)
             payload = {
+                "reward/_call": self._reward_call_counter,
                 "reward/VQ_mean": float(vq_t.mean().item()),
                 "reward/VQ_std":  float(vq_t.std(unbiased=False).item()),
                 "reward/MQ_mean": float(mq_t.mean().item()),
@@ -1008,11 +1022,9 @@ class VideoAlignRewardModel(PointwiseRewardModel):
                 "reward/TA_std":  float(ta_t.std(unbiased=False).item()),
                 "reward/composite_local_mean": float(comp_t.mean().item()),
             }
-            # No explicit step: wandb uses its internal monotonic counter,
-            # which lives in a separate "axis" from trainer.log_data() (which
-            # passes its own explicit step). The two sets of curves therefore
-            # share the wandb run but not the x-axis — that's fine for
-            # eyeballing reward/* dim-level trends.
-            wandb.log(payload)
+            # commit=False -> do NOT advance wandb's main _step counter.
+            # The data still ships, indexed by `reward/_call` because of the
+            # define_metric registration above.
+            wandb.log(payload, commit=False)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"[VideoAlign] dim-metric log skipped: {e}")
