@@ -3,29 +3,34 @@
 # Model: Wan2.1-T2V-1.3B  (SAME as DanceGRPO `finetune_wan_2_1_grpo.sh`).
 #
 # Reference: TaRoS paper (Li et al. 2026) §5.2 reports the canonical
-# DanceGRPO + VideoAlign + Wan2.1-T2V-1.3B baseline hyperparameters:
-#   - learning_rate : 5e-6
-#   - group_size G  : 16
-#   - total steps   : 220   (reward saturates around this point on Wan1.3B)
-#   - GPUs          : 8 × H100
-# We use these as our target; only the GPU count differs (4 instead of 8).
+# DanceGRPO + VideoAlign + Wan2.1-T2V-1.3B baseline:
+#   - learning_rate : 5e-6,  group_size G : 16,  220 step on 8 × H100
+#
+# v2 (this file): pushed per-step signal +50% and total steps +50% over TaRoS,
+#   after the v1 run (110 epoch × 256 video/step) yielded only ~0.07σ eval
+#   reward gain. TaRoS Fig 6 / Table 1 show DanceGRPO+VideoAlign on Wan1.3B is
+#   a known-weak baseline (Total VBench actually drops 0.12 in their paper),
+#   so a small gain here is expected; v2 simply tries to squeeze more signal
+#   per optimizer.step before considering algorithmic upgrades (TaRoS / 72B
+#   reward model / etc.).
 #
 # Per-step geometry (4 GPU):
-#   group_size                  : 16   = TaRoS / DanceGRPO standard
+#   group_size                  : 24   = TaRoS 16 × 1.5  (more stable group advantage)
 #   per_device_batch_size       : 1
-#   unique_sample_num_per_epoch : 32   = 8 prompts × 4 GPU
+#   unique_sample_num_per_epoch : 32   = 8 prompts × 4 GPU  (unchanged; DanceGRPO
+#                                       deep-optimizes a small prompt pool)
 #   gradient_step_per_epoch     : 2    (Flow-Factory default; needed for PPO ratio ≠ 1)
-#   gradient_accumulation_steps : auto -> (32×16)/(4×1)/2 = 64
-#     => 2 optimizer.step()/epoch, each uses 32×16/2 = 256 video samples
-#   max_epochs                  : 110  (220 optimizer.step total == TaRoS Wan1.3B)
+#   gradient_accumulation_steps : auto -> (32×24)/(4×1)/2 = 96
+#     => 2 optimizer.step()/epoch, each uses 32×24/2 = 384 video samples
+#   max_epochs                  : 165  (330 optimizer.step total = 1.5× TaRoS)
 #
 # IMPORTANT: gradient_step_per_epoch MUST be ≥ 2.
 #   With =1, policy never updates within an epoch → ratio ≡ 1 → PPO clipping
-#   inactive → loss degenerates to vanilla policy gradient (the failure mode
-#   observed in our previous 280-step run where reward stayed flat).
+#   inactive → loss degenerates to vanilla policy gradient.
 #
 # Wall-clock budget (4 GPU, 1.3B model):
-#   ~4.5 min / epoch × 110 epoch ≈ 8 hours  (single overnight run)
+#   v1 baseline: ~4.5 min / epoch × 110 epoch ≈ 8 hours
+#   v2 (here):   ~6.5 min / epoch × 165 epoch ≈ 18 hours (one overnight run)
 #
 # Other deviations from `t2v.yaml`:
 #   - num_processes:        8  -> 4   (only 4 GPUs available)
@@ -72,7 +77,7 @@ log:
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"  # Directory to save model checkpoints and logs
-  save_freq: 10  # [DIFF] TaRoS short-run: 11 ckpts over 110 epoch (= 220 optimizer.step)
+  save_freq: 15  # [DIFF] v2: 11 ckpts over 165 epoch (= 330 optimizer.step)
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
 
 # Training Configuration
@@ -94,13 +99,13 @@ train:
   num_inference_steps: 10  # Number of timesteps
   guidance_scale: 5.0  # Guidance scale for sampling
  
-  # Batch and sampling  [DIFF] TaRoS/DanceGRPO standard + reduced unique prompts for 4 GPU
+  # Batch and sampling  [DIFF] v2: group_size 16 → 24 to boost per-step signal
   per_device_batch_size: 1                # video-scale fwd granularity
-  group_size: 16                          # = TaRoS §5.2 / DanceGRPO Wan2.1 standard
+  group_size: 24                          # [v2] +50% over TaRoS 16 for more stable advantage
   global_std: false                       # group-normalize per prompt (DanceGRPO style)
-  unique_sample_num_per_epoch: 32         # 8 prompts × 4 GPU
+  unique_sample_num_per_epoch: 32         # 8 prompts × 4 GPU (DanceGRPO deep-optimizes few prompts)
   gradient_step_per_epoch: 2              # Flow-Factory default. Do NOT lower to 1: see header comment.
-  gradient_accumulation_steps: auto       # auto -> (32×16)/(4×1)/2 = 64  =>  256 video / optimizer.step
+  gradient_accumulation_steps: auto       # auto -> (32×24)/(4×1)/2 = 96  =>  384 video / optimizer.step
   
   # Optimization
   learning_rate: 5.0e-6  # [DIFF] TaRoS §5.2 reports 5e-6 for Wan1.3B + DanceGRPO + VideoAlign
@@ -111,7 +116,7 @@ train:
 
   # EMA
   ema_decay: 0.9  # EMA decay rate (0 to disable)
-  ema_update_interval: 2  # [DIFF] TaRoS short-run: 55 EMA updates over 110 epoch
+  ema_update_interval: 3  # [DIFF] v2: 55 EMA updates over 165 epoch
   ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
 
   # Gradient checkpointing
@@ -121,15 +126,17 @@ train:
   # Seed
   seed: 42  # Random seed
 
-  # Training duration cap.  [DIFF] TaRoS §5.2: Wan1.3B trains for 220 optimizer.step().
-  # gradient_step_per_epoch=2 → 1 epoch == 2 optimizer.step() → 110 epoch = 220 step.
+  # Training duration cap.  [DIFF] v2: 1.5× TaRoS step count.
+  # gradient_step_per_epoch=2 → 1 epoch == 2 optimizer.step() → 165 epoch = 330 step.
   #   TaRoS / DanceGRPO Wan1.3B baseline: 220 step (8 H100, G=16, lr=5e-6)
-  #   Ours (4 GPU):                       220 step (110 epoch × 2 step/epoch)
-  # Each epoch processes 32 unique prompts × 16 rollouts = 512 video gens.
-  # TaRoS Fig 6 shows DanceGRPO+VideoAlign reward saturates around step 100-200
-  # on Wan1.3B (collapse-boost cycle). Reward should start rising by step 30-50.
-  # If reward is still flat after 50 step → trainer/LoRA/reward link has a bug.
-  max_epochs: 110
+  #   v1 (ours):                          220 step (110 epoch × 2)  → +0.07σ eval
+  #   v2 (this):                          330 step (165 epoch × 2)  +50% steps
+  # Each epoch processes 32 unique prompts × 24 rollouts = 768 video gens.
+  # TaRoS Fig 6 shows DanceGRPO+VideoAlign on Wan1.3B is a known-weak baseline
+  # (Total VBench actually drops 0.12 in their Table 1). Don't expect big gains;
+  # if eval reward stalls below -2.4σ after 165 epoch, algorithmic upgrades
+  # (TaRoS dynamic weighting / Qwen2.5-VL-72B reward / etc.) are needed.
+  max_epochs: 165
 
 # Scheduler Configuration
 scheduler:
@@ -148,7 +155,7 @@ eval:
   seed: 42  # Eval seed (defaults to training seed)
   guidance_scale: 5.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
-  eval_freq: 10  # [DIFF] TaRoS short-run: 11 evals over 110 epoch (= 220 optimizer.step)
+  eval_freq: 15  # [DIFF] v2: 11 evals over 165 epoch (= 330 optimizer.step)
 
 # Reward Model Configuration  # [DIFF] VideoAlign (1:1:1) instead of CLIP + PickScore
 rewards:

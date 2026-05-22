@@ -904,10 +904,22 @@ class VideoAlignRewardModel(PointwiseRewardModel):
             )
 
         device = self.device
+        # Training signal lists (post-`use_norm` selection; what goes into RL):
         vq_list: List[float] = []
         mq_list: List[float] = []
         ta_list: List[float] = []
         composite_list: List[float] = []
+        # Raw + z-scored lists, kept independently for wandb logging so both
+        # views are visible regardless of `self.use_norm`.
+        vq_raw_list: List[float] = []
+        mq_raw_list: List[float] = []
+        ta_raw_list: List[float] = []
+        vq_norm_list: List[float] = []
+        mq_norm_list: List[float] = []
+        ta_norm_list: List[float] = []
+
+        # Pull VideoAlign's z-score constants once (None ckpts skip norm).
+        infer_cfg = getattr(self.inferencer, "_inference_config", None)
 
         with tempfile.TemporaryDirectory(prefix="videoalign_") as tmpdir:
             for i, (frames, pmt) in enumerate(zip(video, prompt)):
@@ -915,16 +927,33 @@ class VideoAlignRewardModel(PointwiseRewardModel):
                 try:
                     _frames_to_mp4(frames, mp4_path, fps=self.video_fps)
                     abs_path = os.path.abspath(mp4_path)
-                    rew = self.inferencer.reward([abs_path], [pmt], use_norm=self.use_norm)
-                    vq = float(rew[0]["VQ"])
-                    mq = float(rew[0]["MQ"])
-                    ta = float(rew[0]["TA"])
+                    # Always request RAW from the inferencer; we apply z-score
+                    # ourselves so we can log both scales at once.
+                    rew = self.inferencer.reward([abs_path], [pmt], use_norm=False)
+                    vq_raw = float(rew[0]["VQ"])
+                    mq_raw = float(rew[0]["MQ"])
+                    ta_raw = float(rew[0]["TA"])
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         f"[VideoAlign] reward computation failed for sample {i}: {e}; "
                         f"falling back to {self.fallback_value}."
                     )
-                    vq = mq = ta = self.fallback_value
+                    vq_raw = mq_raw = ta_raw = self.fallback_value
+
+                # Apply VideoAlign's fixed z-score (same constants inference.py
+                # uses); falls back to raw if config is missing.
+                if infer_cfg is not None:
+                    vq_norm = (vq_raw - infer_cfg["VQ_mean"]) / infer_cfg["VQ_std"]
+                    mq_norm = (mq_raw - infer_cfg["MQ_mean"]) / infer_cfg["MQ_std"]
+                    ta_norm = (ta_raw - infer_cfg["TA_mean"]) / infer_cfg["TA_std"]
+                else:
+                    vq_norm, mq_norm, ta_norm = vq_raw, mq_raw, ta_raw
+
+                # Pick the variant used as the RL training signal.
+                if self.use_norm:
+                    vq, mq, ta = vq_norm, mq_norm, ta_norm
+                else:
+                    vq, mq, ta = vq_raw, mq_raw, ta_raw
 
                 vq_list.append(vq)
                 mq_list.append(mq)
@@ -932,6 +961,12 @@ class VideoAlignRewardModel(PointwiseRewardModel):
                 composite_list.append(
                     self.vq_coef * vq + self.mq_coef * mq + self.ta_coef * ta
                 )
+                vq_raw_list.append(vq_raw)
+                mq_raw_list.append(mq_raw)
+                ta_raw_list.append(ta_raw)
+                vq_norm_list.append(vq_norm)
+                mq_norm_list.append(mq_norm)
+                ta_norm_list.append(ta_norm)
 
         rewards = torch.tensor(composite_list, dtype=torch.float32, device=device)
 
@@ -942,7 +977,18 @@ class VideoAlignRewardModel(PointwiseRewardModel):
         # dedicated step axis (`reward/_call`) registered via
         # wandb.define_metric, so this never collides with the trainer's
         # explicit step on `train/*` and `eval/*` panels.
-        self._maybe_log_dim_metrics(vq_list, mq_list, ta_list, composite_list)
+        self._maybe_log_dim_metrics(
+            vq_list=vq_list,
+            mq_list=mq_list,
+            ta_list=ta_list,
+            composite_list=composite_list,
+            vq_raw_list=vq_raw_list,
+            mq_raw_list=mq_raw_list,
+            ta_raw_list=ta_raw_list,
+            vq_norm_list=vq_norm_list,
+            mq_norm_list=mq_norm_list,
+            ta_norm_list=ta_norm_list,
+        )
 
         extra_info = None
         if self.return_metrics:
@@ -966,14 +1012,31 @@ class VideoAlignRewardModel(PointwiseRewardModel):
         mq_list: List[float],
         ta_list: List[float],
         composite_list: List[float],
+        vq_raw_list: Optional[List[float]] = None,
+        mq_raw_list: Optional[List[float]] = None,
+        ta_raw_list: Optional[List[float]] = None,
+        vq_norm_list: Optional[List[float]] = None,
+        mq_norm_list: Optional[List[float]] = None,
+        ta_norm_list: Optional[List[float]] = None,
     ) -> None:
-        """Push VQ / MQ / TA per-call batch means to the active wandb run.
+        """Push per-call batch stats to the active wandb run.
 
-        Uses an INDEPENDENT step axis (``reward/_call``) registered via
-        ``wandb.define_metric`` on first call, so this never collides with the
-        trainer's explicit step on ``train/*`` and ``eval/*`` panels.
+        Logs three views of the reward, all under the ``reward/*`` namespace
+        with an INDEPENDENT step axis (``reward/_call``):
 
-        Without this, naive ``wandb.log(payload)`` here would auto-increment
+        * ``reward/{VQ,MQ,TA}_{mean,std}`` -- the TRAINING signal (this is
+          what GRPO actually optimizes; equals raw or z-scored depending on
+          ``self.use_norm``).
+        * ``reward/{VQ,MQ,TA}_raw_{mean,std}`` -- always the RAW VideoAlign
+          reward (model logits, no z-score). Directly comparable to TaRoS
+          Table 4 and other published VideoAlign numbers.
+        * ``reward/{VQ,MQ,TA}_norm_{mean,std}`` -- always the z-SCORED
+          VideoAlign reward, using the fixed ``inference_config`` constants
+          from ``model_config.json``.
+
+        Uses ``wandb.define_metric`` on first call so this never collides
+        with the trainer's explicit step on ``train/*`` and ``eval/*`` panels.
+        Without it, naive ``wandb.log(payload)`` here would auto-increment
         wandb's internal step counter past the trainer's explicit step and
         cause wandb to silently drop all subsequent ``train/*`` logs.
 
@@ -1008,20 +1071,57 @@ class VideoAlignRewardModel(PointwiseRewardModel):
                 self._reward_call_counter = 0
 
             self._reward_call_counter += 1
-            vq_t = torch.tensor(vq_list, dtype=torch.float32)
-            mq_t = torch.tensor(mq_list, dtype=torch.float32)
-            ta_t = torch.tensor(ta_list, dtype=torch.float32)
-            comp_t = torch.tensor(composite_list, dtype=torch.float32)
+
+            def _stats(xs: List[float]) -> tuple:
+                t = torch.tensor(xs, dtype=torch.float32)
+                return float(t.mean().item()), float(t.std(unbiased=False).item())
+
+            vq_mean, vq_std = _stats(vq_list)
+            mq_mean, mq_std = _stats(mq_list)
+            ta_mean, ta_std = _stats(ta_list)
+            comp_mean = float(torch.tensor(composite_list, dtype=torch.float32).mean().item())
+
             payload = {
                 "reward/_call": self._reward_call_counter,
-                "reward/VQ_mean": float(vq_t.mean().item()),
-                "reward/VQ_std":  float(vq_t.std(unbiased=False).item()),
-                "reward/MQ_mean": float(mq_t.mean().item()),
-                "reward/MQ_std":  float(mq_t.std(unbiased=False).item()),
-                "reward/TA_mean": float(ta_t.mean().item()),
-                "reward/TA_std":  float(ta_t.std(unbiased=False).item()),
-                "reward/composite_local_mean": float(comp_t.mean().item()),
+                # Training signal (= raw or norm depending on use_norm config)
+                "reward/VQ_mean": vq_mean, "reward/VQ_std": vq_std,
+                "reward/MQ_mean": mq_mean, "reward/MQ_std": mq_std,
+                "reward/TA_mean": ta_mean, "reward/TA_std": ta_std,
+                "reward/composite_local_mean": comp_mean,
             }
+
+            # Raw (TaRoS-comparable) view, always logged when available
+            if vq_raw_list is not None:
+                vq_raw_mean, vq_raw_std = _stats(vq_raw_list)
+                mq_raw_mean, mq_raw_std = _stats(mq_raw_list)
+                ta_raw_mean, ta_raw_std = _stats(ta_raw_list)
+                payload.update({
+                    "reward/VQ_raw_mean": vq_raw_mean, "reward/VQ_raw_std": vq_raw_std,
+                    "reward/MQ_raw_mean": mq_raw_mean, "reward/MQ_raw_std": mq_raw_std,
+                    "reward/TA_raw_mean": ta_raw_mean, "reward/TA_raw_std": ta_raw_std,
+                    "reward/composite_raw_mean": (
+                        self.vq_coef * vq_raw_mean
+                        + self.mq_coef * mq_raw_mean
+                        + self.ta_coef * ta_raw_mean
+                    ),
+                })
+
+            # Z-scored view, always logged when available
+            if vq_norm_list is not None:
+                vq_n_mean, vq_n_std = _stats(vq_norm_list)
+                mq_n_mean, mq_n_std = _stats(mq_norm_list)
+                ta_n_mean, ta_n_std = _stats(ta_norm_list)
+                payload.update({
+                    "reward/VQ_norm_mean": vq_n_mean, "reward/VQ_norm_std": vq_n_std,
+                    "reward/MQ_norm_mean": mq_n_mean, "reward/MQ_norm_std": mq_n_std,
+                    "reward/TA_norm_mean": ta_n_mean, "reward/TA_norm_std": ta_n_std,
+                    "reward/composite_norm_mean": (
+                        self.vq_coef * vq_n_mean
+                        + self.mq_coef * mq_n_mean
+                        + self.ta_coef * ta_n_mean
+                    ),
+                })
+
             # commit=False -> do NOT advance wandb's main _step counter.
             # The data still ships, indexed by `reward/_call` because of the
             # define_metric registration above.
