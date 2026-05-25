@@ -61,6 +61,18 @@ class EvaluationArguments(ArgABC):
         default=10,
         metadata={"help": "Evaluation frequency (in epochs). 0 for no evaluation."},
     )
+    max_dataset_size: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, limits the number of samples loaded from the test split to this "
+                "value. Independent of data.max_dataset_size, which applies to the train "
+                "split. Use this to keep periodic in-loop eval cheap (e.g. 128 prompts) "
+                "while leaving the train split untouched. None means inherit "
+                "data.max_dataset_size (legacy behavior)."
+            )
+        },
+    )
     def __post_init__(self):
         if not self.resolution:
             logger.warning("`resolution` is not set, using default (512, 512).")

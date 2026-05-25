@@ -75,11 +75,21 @@
 #   flip is `enable_gradient_checkpointing: true` (still cheaper than reducing
 #   batch/resolution).
 #
-# Eval cost:
-#   eval at 480×832×53 @ 50 step on 250 prompts will take ~10-20× longer than
-#   v1's ~16 min/eval.  eval_freq raised 10 → 33 to cap eval overhead at
-#   ~4 evals (step 0, 33, 66, 99) over 110 epoch.  Bump higher if eval is the
-#   bottleneck after the smoke test.
+# Eval cost (in-loop monitoring):
+#   eval at 480×832×53 @ 50 step is ~46 s/sample (measured); on 4 GPU sharded:
+#     - 1000 prompts (TaRoS-scale): 1000/4 × 46 s ≈ 3 h per eval (too expensive
+#       to do every few epochs; needed only for final paper comparison)
+#     - 128 prompts:                 128/4 × 46 s ≈ 25 min per eval (cheap
+#       enough to do every 11 epochs for a dense reward curve)
+#   We use 128 in-loop (`eval.max_dataset_size: 128`, `eval_freq: 11`
+#   → 10 evals over 110 epoch, ~4 h total eval overhead).
+#   For the final paper-comparable number, run a SEPARATE eval-only job after
+#   training with `eval.max_dataset_size: 1000` (and resume_path pointing to
+#   the final LoRA checkpoint).  See yaml `eval:` block below for details.
+#
+#   NOTE: TaRoS Table 4 used 1.4k iStock prompts; we use DanceGRPO's bundled
+#   1024-prompt test split.  Absolute numbers won't match, but the per-method
+#   Δ (vs. Wan1.3B baseline) direction and magnitude should be reproducible.
 #
 # Other deviations from `t2v.yaml`:
 #   - num_processes:        8  -> 4   (only 4 GPUs available)
@@ -128,8 +138,10 @@ log:
   project: "Flow-Factory"  # Project name for logging
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
   save_dir: "saves/"  # Directory to save model checkpoints and logs
-  save_freq: 11  # 10 ckpts over 110 epoch (LoRA ckpts are small ~700MB; keep
-                 # finer save granularity than eval_freq for ckpt selection later)
+  save_freq: 11  # 10 ckpts over 110 epoch, aligned with eval_freq so every
+                 # evaluated step also has a saved checkpoint (lets us pick the
+                 # best LoRA by eval reward and run the separate full-1000 eval
+                 # against it). LoRA ckpts are ~700 MB, total ~7 GB → cheap.
   save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
 
 # Training Configuration
@@ -212,11 +224,20 @@ eval:
   seed: 42                 # Eval seed (defaults to training seed)
   guidance_scale: 5.0
   num_inference_steps: 50  # TaRoS §5.2 Inference: "50 sampling steps"
-  eval_freq: 33            # 4 evals over 110 epoch (step 0, 33, 66, 99).
-                           # Raised from 10 because each eval at 480×832×53 @ 50
-                           # step is ~10-20× more expensive than v1's ~16 min/eval.
-                           # If smoke test shows eval is the bottleneck, raise
-                           # further (e.g. 55 → 2 evals, or 110 → only initial).
+  eval_freq: 11            # 10 evals over 110 epoch (step 0, 11, 22, ..., 99) for
+                           # dense training-curve monitoring.  Possible because
+                           # max_dataset_size below caps eval at 128 prompts
+                           # (~25 min/eval on 4 GPU, vs. ~3 h for full 1000).
+  max_dataset_size: 128    # In-loop eval uses 128 prompts (32/GPU × 4 GPU) for
+                           # fast feedback during training. This does NOT touch
+                           # data.max_dataset_size (= 1000), so the train split
+                           # is unaffected.  For paper-comparable final numbers
+                           # (TaRoS Table 4 used 1.4k iStock prompts; we use
+                           # the DanceGRPO test split, so absolute numbers won't
+                           # match, but the Δ direction/magnitude should), run a
+                           # SEPARATE eval-only job after training with this
+                           # value bumped to 1000 (or removed, to use the full
+                           # test.txt = 1024).
 
 # Reward Model Configuration  # [DIFF] VideoAlign (1:1:1) instead of CLIP + PickScore
 rewards:

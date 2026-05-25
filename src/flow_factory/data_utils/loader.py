@@ -287,10 +287,17 @@ def get_dataloader(
             }
         )
         test_preprocess_kwargs = filter_kwargs(preprocess_func, **test_preprocess_kwargs)
+        test_base_kwargs = {**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs}
+        # Allow eval_args.max_dataset_size to override data_args.max_dataset_size for the
+        # test split only. Lets us keep in-loop eval cheap (e.g. 128 prompts) without
+        # truncating the train split. None falls back to data_args.max_dataset_size.
+        eval_max = getattr(eval_args, 'max_dataset_size', None)
+        if eval_max is not None:
+            test_base_kwargs['max_dataset_size'] = eval_max
         test_dataset = _create_or_load_dataset(
             split="test",
             accelerator=accelerator,
-            base_kwargs={**base_kwargs, 'preprocess_kwargs': test_preprocess_kwargs},
+            base_kwargs=test_base_kwargs,
             enable_distributed=enable_distributed,
             preprocess_parallelism=preprocess_parallelism,
         )
