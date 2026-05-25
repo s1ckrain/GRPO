@@ -1,261 +1,133 @@
-# Wan2.1 T2V × DanceGRPO baseline reproduction × VideoAlign reward
+# Wan2.1-T2V-1.3B × DanceGRPO baseline × VideoAlign reward (LoRA).
 #
-# Model: Wan2.1-T2V-1.3B  (SAME as DanceGRPO `finetune_wan_2_1_grpo.sh`).
+# Target metrics (TaRoS Table 4, DanceGRPO+VideoAlign+3-dim, Wan1.3B):
+#   VQ 3.448 → 3.412 | MQ 0.2911 → 0.3022 | TA -1.914 → -1.172
 #
-# Reference: TaRoS paper (Li et al. 2026) §5.2 reports the canonical
-# DanceGRPO + VideoAlign + Wan2.1-T2V-1.3B baseline configuration. This file
-# aims to reproduce that baseline (NOT TaRoS itself; see "NOT applied" below).
-#
-# ----------------------------------------------------------------------------
-# v2 (this file): TaRoS-DanceGRPO baseline aligned (training rollout & eval at
-# 480×832×53 frames).  v1 used Flow-Factory's default low-cost sampling
-# (256×256×5 @ 10 step) which underperformed: VideoAlign reward gives 0.33s
-# videos only ~4 frames of motion signal (FPS_MIN_FRAMES=4 floor in
-# VideoAlign/vision_process.py L36), so v1 MQ stayed flat.  TaRoS Table 4
-# shows DanceGRPO+VideoAlign+3-dim on Wan1.3B should give MQ 0.2911 → 0.3022
-# and TA -1.914 → -1.172, confirming sampling resolution / frame count is the
-# critical knob, not LoRA vs full ft.
-# ----------------------------------------------------------------------------
-#
-# Sampling configuration (source of every number):
-#   train.resolution        = [480, 832]   <- TaRoS §5.2 "videos are sampled at
-#                                              480 × 832 × 53 frames at 15 fps"
-#                                              (Training Setup paragraph).
-#   train.num_frames        = 53           <- same source.
-#   train.num_inference_steps = 20         <- TaRoS paper doesn't specify the
-#                                              training SDE step count; we adopt
-#                                              DanceGRPO's official training value
-#                                              `--sampling_steps 20` from
-#                                              DanceGRPO/scripts/finetune/
-#                                              finetune_wan_2_1_grpo.sh L40.
-#                                              (TaRoS inherits DanceGRPO's
-#                                              codebase, so this is the most
-#                                              probable training default.)
-#   eval.resolution         = [480, 832]   <- TaRoS §5.2 Inference: "we configure
-#                                              50 sampling steps with a resolution
-#                                              of 480×832×53 (H×W×T) at 15 fps".
-#   eval.num_frames         = 53           <- same source.
-#   eval.num_inference_steps = 50          <- same source.
-#
-# Optimizer / RL geometry (4 GPU, follows TaRoS §5.2):
-#   learning_rate               : 5e-6           (TaRoS §5.2)
-#   group_size                  : 16             (TaRoS §5.2 "group size G = 16")
-#   max_epochs                  : 110            (110 × 2 opt.step/epoch = 220
-#                                                 opt.step, matches TaRoS §5.2
-#                                                 "Training is performed for
-#                                                 220 steps on 8 H100 GPUs".)
-#   per_device_batch_size       : 1
-#   unique_sample_num_per_epoch : 32             (8 prompts × 4 GPU)
-#   gradient_step_per_epoch     : 2              (PPO ratio ≠ 1 requirement)
-#   gradient_accumulation_steps : auto -> 64
-#     => 2 optimizer.step()/epoch, each uses 32×16/2 = 256 video samples.
-#
-# IMPORTANT: gradient_step_per_epoch MUST be ≥ 2.
-#   With =1, policy never updates within an epoch → ratio ≡ 1 → PPO clipping
-#   inactive → loss degenerates to vanilla policy gradient.
-#
-# Wall-clock budget (4 H200, 1.3B model, LoRA rank 64) — UNCERTAIN:
-#   Forward-time ratio vs v1 depends heavily on FlashAttention performance at
-#   L=87360 tokens (480×832×53). Reasonable range:
-#       - optimistic (FA scaling near-linear)  : ~2-4 hours / epoch
-#       - pessimistic (compute-bound O(L²))    : ~10-15 hours / epoch
-#   => 110 epoch total: anywhere from ~10 days to ~60 days.
-#   STRONGLY recommend running a 1-epoch smoke test first to measure actual
-#   wall-clock, then deciding whether to:
-#       (a) proceed as-is,
-#       (b) drop num_inference_steps 20 → 10 (≈ 2x speedup),
-#       (c) drop num_frames 53 → 33 (still gives VideoAlign 33/15*2 ≈ 4-6 frames,
-#           the MINIMUM that beats FPS_MIN_FRAMES=4 floor; below 33 frames the
-#           reward signal degrades to v1-like 4-frame motion blindness),
-#       (d) drop max_epochs (sacrifices step-count alignment with TaRoS).
-#
-# Memory note:
-#   enable_gradient_checkpointing is kept FALSE (user's call).  If 480×832×53
-#   sampling activations + LoRA backward OOMs on H200 141GB, the first knob to
-#   flip is `enable_gradient_checkpointing: true` (still cheaper than reducing
-#   batch/resolution).
-#
-# Eval cost (in-loop monitoring):
-#   eval at 480×832×53 @ 50 step is ~46 s/sample (measured); on 4 GPU sharded:
-#     - 1000 prompts (TaRoS-scale): 1000/4 × 46 s ≈ 3 h per eval (too expensive
-#       to do every few epochs; needed only for final paper comparison)
-#     - 128 prompts:                 128/4 × 46 s ≈ 25 min per eval (cheap
-#       enough to do every 11 epochs for a dense reward curve)
-#   We use 128 in-loop (`eval.max_dataset_size: 128`, `eval_freq: 11`
-#   → 10 evals over 110 epoch, ~4 h total eval overhead).
-#   For the final paper-comparable number, run a SEPARATE eval-only job after
-#   training with `eval.max_dataset_size: 1000` (and resume_path pointing to
-#   the final LoRA checkpoint).  See yaml `eval:` block below for details.
-#
-#   NOTE: TaRoS Table 4 used 1.4k iStock prompts; we use DanceGRPO's bundled
-#   1024-prompt test split.  Absolute numbers won't match, but the per-method
-#   Δ (vs. Wan1.3B baseline) direction and magnitude should be reproducible.
-#
-# Other deviations from `t2v.yaml`:
-#   - num_processes:        8  -> 4   (only 4 GPUs available)
-#   - model.model_name_or_path        (local Wan2.1-1.3B weights)
-#   - data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts)
-#   - scheduler.dynamics_type: Flow-SDE -> Dance-SDE
-#   - rewards: CLIP + PickScore -> VideoAlign (1:1:1, DanceGRPO-style static weights)
-#
-# NOT applied (TaRoS-specific, beyond this baseline reproduction):
-#   TaRoS algorithm-specific hyperparameters (τI, τII, β) are NOT used here.
-#   Those control TaRoS's dynamic reward mixing (paper §4.2); the DanceGRPO
-#   baseline reproduced here uses static 1:1:1 weights
-#   (vq_coef/mq_coef/ta_coef below).
+# Quick reference (commonly tweaked knobs):
+#   train.num_frames    49     # min 41 to keep VideoAlign motion signal > v1 floor
+#   train.group_size    8      # TaRoS=16, DanceGRPO=12; we use 8 for 2× sampling speed
+#   train.num_inference_steps  20   # halve to 10 for another 2× sampling speed
+#   max_epochs          110    # 110 epoch × 2 opt.step = 220 step (TaRoS §5.2)
+#   eval.max_dataset_size  128  # bump to 1000 for final paper-style eval
 
 # Environment Configuration
-launcher: "accelerate"  # Options: accelerate
-config_file: config/deepspeed/deepspeed_zero2.yaml  # Path to distributed config file (optional)
-num_processes: 4  # [DIFF] 4 GPUs instead of 8
+launcher: "accelerate"
+config_file: config/deepspeed/deepspeed_zero2.yaml
+num_processes: 4  # [DIFF] 4 GPUs
 main_process_port: 29500
 mixed_precision: "bf16"  # Options: no, fp16, bf16
 
 # Data Configuration
 data:
-  dataset_dir: "dataset/vid_prompt"  # DanceGRPO official 50k video prompts (vs. pickscore = T2I-only)
-  preprocessing_batch_size: 8  # Batch size for preprocessing
-  dataloader_num_workers: 16  # Number of workers for DataLoader
-  force_reprocess: true  # Force reprocessing of the dataset
-  cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
-  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  dataset_dir: "dataset/vid_prompt"  # [DIFF] DanceGRPO 50k video prompts
+  preprocessing_batch_size: 8
+  dataloader_num_workers: 16
+  force_reprocess: true
+  cache_dir: "~/.cache/flow_factory/datasets"
+  max_dataset_size: 1000  # train split cap; test split uses eval.max_dataset_size
   sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
 
 # Model Configuration
 model:
-  finetune_type: 'lora' # Options: full, lora
-  lora_rank : 64
-  lora_alpha : 128
-  target_components: 'transformer' # Options: transformer (Wan2.1 & Wan2.2), transformer_2 (Wan2.2)
-  target_modules: "default" # Options: all, default, or list of module names like ["to_k", "to_q", "to_v", "to_out.0"]
-  model_name_or_path: "/aigc/posttrain/siyuanfu/models/Wan2.1"  # [DIFF] local Wan2.1 weights
-  model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
-  resume_path: null # Path to load previous checkpoint/lora adapter
-  resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+  finetune_type: 'lora'  # Options: full, lora
+  lora_rank: 64
+  lora_alpha: 128
+  target_components: 'transformer'
+  target_modules: "default"
+  model_name_or_path: "/aigc/posttrain/siyuanfu/models/Wan2.1"  # [DIFF] local weights
+  model_type: "wan2_t2v"  # Options: wan2_t2v, wan2_i2v, wan2_v2v
+  resume_path: null
+  resume_type: null  # Options: lora, full, state, null (auto)
 
 log:
-  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
-  project: "Flow-Factory"  # Project name for logging
+  run_name: null
+  project: "Flow-Factory"
   logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
-  save_dir: "saves/"  # Directory to save model checkpoints and logs
-  save_freq: 11  # 10 ckpts over 110 epoch, aligned with eval_freq so every
-                 # evaluated step also has a saved checkpoint (lets us pick the
-                 # best LoRA by eval reward and run the separate full-1000 eval
-                 # against it). LoRA ckpts are ~700 MB, total ~7 GB → cheap.
-  save_model_only: true  # Save only the model weights (not optimizer, scheduler, etc.)
+  save_dir: "saves/"
+  save_freq: 11  # aligned with eval_freq → every evaluated step has a ckpt
+  save_model_only: true
 
 # Training Configuration
 train:
-  # Trainer settings
-  trainer_type: 'grpo' # Options: 'grpo', 'nft', 'awm'
-  advantage_aggregation: 'gdpo' # Options: 'sum', 'gdpo'
-  # Clipping
-  clip_range: 1.0e-4  # PPO/GRPO clipping range
-  adv_clip_range: 5.0  # Advantage clipping range
-  # KL div
-  kl_type: 'v-based' # Options: 'x-based', 'v-based'
-  kl_beta: 0 # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
-  ref_param_device: 'cuda' # Options: cpu, cuda
+  trainer_type: 'grpo'  # Options: 'grpo', 'nft', 'awm'
+  advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'
 
-  # Sampling settings  [v2: aligned with TaRoS §5.2 + DanceGRPO official training]
-  resolution: [480, 832]   # TaRoS §5.2 training rollout resolution (H, W)
-  num_frames: 53           # TaRoS §5.2; (53 - 1) % 4 == 0 ✓; gives VideoAlign reward
-                           # ~8 frames of motion signal (vs. 4 frames at num_frames=5)
-  num_inference_steps: 20  # DanceGRPO official `--sampling_steps 20`
-                           # (DanceGRPO/scripts/finetune/finetune_wan_2_1_grpo.sh L40);
-                           # TaRoS paper inherits DanceGRPO codebase.
-  guidance_scale: 5.0      # Guidance scale for sampling
- 
-  # Batch and sampling
-  per_device_batch_size: 1                # video-scale fwd granularity
-  group_size: 16                          # TaRoS / DanceGRPO standard
-  global_std: false                       # group-normalize per prompt (DanceGRPO style)
-  unique_sample_num_per_epoch: 32         # 8 prompts × 4 GPU (DanceGRPO deep-optimizes few prompts)
-  gradient_step_per_epoch: 2              # Flow-Factory default. Do NOT lower to 1: see header comment.
-  gradient_accumulation_steps: auto       # auto -> (32×16)/(4×1)/2 = 64  =>  256 video / optimizer.step
-  
+  clip_range: 1.0e-4
+  adv_clip_range: 5.0
+
+  kl_type: 'v-based'  # Options: 'x-based', 'v-based'
+  kl_beta: 0  # ~1e-2 for x-based, ~1e-3 for v-based, 0 disables
+  ref_param_device: 'cuda'  # Options: cpu, cuda
+
+  # Sampling
+  resolution: [480, 832]
+  num_frames: 49  # must satisfy (num_frames - 1) % 4 == 0
+  num_inference_steps: 20
+  guidance_scale: 5.0
+
+  # Batch
+  per_device_batch_size: 1
+  group_size: 8
+  global_std: false
+  unique_sample_num_per_epoch: 32
+  gradient_step_per_epoch: 2  # MUST be >= 2 (else ratio≡1, PPO clipping inactive)
+  gradient_accumulation_steps: auto
+
   # Optimization
-  learning_rate: 5.0e-6  # [DIFF] TaRoS §5.2 reports 5e-6 for Wan1.3B + DanceGRPO + VideoAlign
-  adam_weight_decay: 1.0e-4  # AdamW weight decay
-  adam_betas: [0.9, 0.999]  # AdamW betas
-  adam_epsilon: 1.0e-8  # AdamW epsilon
-  max_grad_norm: 1.0  # Max gradient norm for clipping
+  learning_rate: 5.0e-6
+  adam_weight_decay: 1.0e-4
+  adam_betas: [0.9, 0.999]
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
 
   # EMA
-  ema_decay: 0.9  # EMA decay rate (0 to disable)
-  ema_update_interval: 2  # 55 EMA updates over 110 epoch
-  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
+  ema_decay: 0.9
+  ema_update_interval: 2
+  ema_device: "cuda"  # Options: cpu, cuda
 
-  # Gradient checkpointing
-  enable_gradient_checkpointing: false  # Enable gradient checkpointing to save memory with extra compute
-  offload_samples_to_cpu: true  # Required for video models: per-sample tensors are GB-scale; without offload, sample()/optimize() OOMs at num_batches_per_epoch > 1.
+  # Memory
+  enable_gradient_checkpointing: true  # REQUIRED at 480×832×49; backward OOMs without it
+  offload_samples_to_cpu: true  # required for video models (per-sample tensors are GB-scale)
 
-  # Seed
-  seed: 42  # Random seed
-
-  # Training duration cap. Aligned with TaRoS §5.2 step count.
-  # gradient_step_per_epoch=2 → 1 epoch == 2 optimizer.step() → 110 epoch = 220 step.
-  #   TaRoS / DanceGRPO Wan1.3B baseline: 220 step (8 H100, G=16, lr=5e-6).
-  # Each epoch processes 32 unique prompts × 16 rollouts = 512 video gens.
-  # Target metrics (TaRoS Table 4, DanceGRPO+VideoAlign+3-dim on Wan1.3B):
-  #   VQ:    3.448 → 3.412 (↓ slight, due to reward hacking on VQ)
-  #   MQ:    0.2911 → 0.3022 (↑ ~4%)
-  #   TA:    -1.914 → -1.172 (↑ ~39%)
-  #   LAION: 5.224 → 5.246 (↑ ~0.4%)
-  # If our v2 eval reward gains roughly match these directions/magnitudes, the
-  # baseline reproduction is successful and we can move on to algorithmic
-  # upgrades (TaRoS dynamic τ/β weighting or Qwen2.5-VL-72B reward).
-  max_epochs: 110
+  seed: 42
+  max_epochs: 110  # 220 optimizer steps (TaRoS §5.2)
 
 # Scheduler Configuration
 scheduler:
-  dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule (vs. Flow-SDE in t2v.yaml)
-  noise_level: 0.9  # Noise level for sampling
-  num_sde_steps: 1  # Number of noise steps
-  sde_steps: [1, 2, 3]  # Custom noise window, noise steps are randomly selected from this list during training
-  seed: 42  # Scheduler seed (for noise step selection)
-  flow_shift: 3.0 # 5.0 for 720P, 3.0 for 480P (from WanPipeline docstring)
+  dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule
+  noise_level: 0.9
+  num_sde_steps: 1
+  sde_steps: [1, 2, 3]
+  seed: 42
+  flow_shift: 3.0  # 5.0 for 720P, 3.0 for 480P
 
-# Evaluation settings  [v2: aligned with TaRoS §5.2 Inference]
+# Evaluation
 eval:
-  resolution: [480, 832]   # TaRoS §5.2 Inference: 480×832 (H, W)
-  num_frames: 53           # TaRoS §5.2 Inference: 53 frames
+  resolution: [480, 832]
+  num_frames: 49  # keep in sync with train.num_frames
   per_device_batch_size: 1
-  seed: 42                 # Eval seed (defaults to training seed)
+  seed: 42
   guidance_scale: 5.0
-  num_inference_steps: 50  # TaRoS §5.2 Inference: "50 sampling steps"
-  eval_freq: 11            # 10 evals over 110 epoch (step 0, 11, 22, ..., 99) for
-                           # dense training-curve monitoring.  Possible because
-                           # max_dataset_size below caps eval at 128 prompts
-                           # (~25 min/eval on 4 GPU, vs. ~3 h for full 1000).
-  max_dataset_size: 128    # In-loop eval uses 128 prompts (32/GPU × 4 GPU) for
-                           # fast feedback during training. This does NOT touch
-                           # data.max_dataset_size (= 1000), so the train split
-                           # is unaffected.  For paper-comparable final numbers
-                           # (TaRoS Table 4 used 1.4k iStock prompts; we use
-                           # the DanceGRPO test split, so absolute numbers won't
-                           # match, but the Δ direction/magnitude should), run a
-                           # SEPARATE eval-only job after training with this
-                           # value bumped to 1000 (or removed, to use the full
-                           # test.txt = 1024).
+  num_inference_steps: 50
+  eval_freq: 11  # 10 evals over 110 epoch
+  max_dataset_size: 128  # in-loop eval; bump to 1000 for final paper-style eval
 
-# Reward Model Configuration  # [DIFF] VideoAlign (1:1:1) instead of CLIP + PickScore
+# Reward Model Configuration  [DIFF] VideoAlign (1:1:1) instead of CLIP+PickScore
 rewards:
   - name: "videoalign"
     reward_model: "videoalign"
     weight: 1.0
-    batch_size: 1                # DanceGRPO calls reward() one video at a time
+    batch_size: 1
     device: "cuda"
     dtype: bfloat16
-    # ---- extra_kwargs (passed through to VideoAlignRewardModel) -----------
-    videoalign_dir: "/aigc/posttrain/siyuanfu/VideoAlign"   # the repo with inference.py + checkpoints/
-    checkpoint_dir: null         # default = {videoalign_dir}/checkpoints
+    videoalign_dir: "/aigc/posttrain/siyuanfu/VideoAlign"
+    checkpoint_dir: null  # default = {videoalign_dir}/checkpoints
     vq_coef: 1.0
     mq_coef: 1.0
     ta_coef: 1.0
-    use_norm: true               # match DanceGRPO (z-score on)
-    video_fps: 15                # matches Wan2.1 generation fps
-    return_metrics: true         # expose VQ/MQ/TA in extra_info for logging
+    use_norm: true  # z-score on (match DanceGRPO)
+    video_fps: 15
+    return_metrics: true
 
 # Optional Evaluation Reward Models
 # eval_rewards:
