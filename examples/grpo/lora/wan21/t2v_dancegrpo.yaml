@@ -50,7 +50,9 @@ log:
 # Training Configuration
 train:
   trainer_type: 'grpo'  # Options: 'grpo', 'nft', 'awm'
-  advantage_aggregation: 'gdpo'  # Options: 'sum', 'gdpo'
+  advantage_aggregation: 'sum'  # [P0-FIX] gdpo→sum: gdpo 的全局 batch-norm 会把 advantage 强行 z-score 到 1,
+                                # 与 DanceGRPO 单 composite reward 的 group-relative 不一致;sum + global_std=false
+                                # 严格等价 DanceGRPO/fastvideo/train_grpo_wan_2_1.py 的 per-group normalize
 
   clip_range: 1.0e-4
   adv_clip_range: 5.0
@@ -81,7 +83,8 @@ train:
   max_grad_norm: 1.0
 
   # EMA
-  ema_decay: 0.9
+  ema_decay: 0.99  # [P0-FIX] 0.9→0.99: ema_decay=0.9 在 update_interval=2 下,2 步后旧权重贡献只剩 0.81,
+                   # 几乎等于裸 policy,失去稳定 eval 的意义;DanceGRPO 使用 0.999,Flow-GRPO 也用 ≥0.99
   ema_update_interval: 2
   ema_device: "cuda"  # Options: cpu, cuda
 
@@ -95,9 +98,10 @@ train:
 # Scheduler Configuration
 scheduler:
   dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule
-  noise_level: 0.9
-  num_sde_steps: 1
-  sde_steps: [1, 2, 3]
+  noise_level: 0.3  # [P0-FIX] 0.9→0.3: 严格对齐 DanceGRPO `finetune_wan_2_1_grpo.sh --eta 0.3`;
+                    # 0.9 让 SDE 噪声主导 group 方差,policy 信号被淹没,且 sample 质量整体偏低
+  num_sde_steps: 1  # Keep Flow-Factory sparse-SDE training; only one SDE transition is trained per rollout.
+  sde_steps: [1, 2, 3]  # Randomly select one early denoising step from this window during training.
   seed: 42
   flow_shift: 3.0  # 5.0 for 720P, 3.0 for 480P
 
