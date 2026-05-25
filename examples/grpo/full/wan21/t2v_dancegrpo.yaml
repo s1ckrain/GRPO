@@ -1,0 +1,192 @@
+# Wan2.1 T2V × DanceGRPO baseline reproduction × VideoAlign reward (FULL fine-tune)
+#
+# Model: Wan2.1-T2V-1.3B  (SAME as DanceGRPO `finetune_wan_2_1_grpo.sh`).
+#
+# Reference: TaRoS paper (Li et al. 2026) §5.2 reports the canonical
+# DanceGRPO + VideoAlign + Wan2.1-T2V-1.3B baseline:
+#   - learning_rate : 5e-6
+#   - group_size G  : 16
+#   - total steps   : 220   (reward saturates around this point on Wan1.3B)
+#   - GPUs          : 8 × H100
+#   - fine-tune     : full (TaRoS uses same recipe as DanceGRPO official, which
+#                     uses FSDP + no LoRA in train_grpo_wan_2_1.py)
+#
+# Why we switched from LoRA to full fine-tune:
+#   - Our prior LoRA run (rank=64, 5.81% trainable) only moved TA (~0.7σ on
+#     training sample) and left VQ/MQ flat. This matches TaRoS Table 4
+#     qualitatively but the absolute gains were small.
+#   - DanceGRPO `train_grpo_wan_2_1.py` uses `params_to_optimize =
+#     transformer.parameters()` (all params, FSDP-sharded). TaRoS §5.2 uses
+#     the same hyperparameters (8×H100, G=16) and is also full fine-tune.
+#   - LoRA's low-rank parameterization can rewrite cross-attention (TA) but
+#     cannot easily change the visual representations VQ/MQ depend on.
+#
+# Per-step geometry (4 × H200 141GB):
+#   group_size                  : 16   = TaRoS §5.2 standard
+#   per_device_batch_size       : 1
+#   unique_sample_num_per_epoch : 32   = 8 prompts × 4 GPU
+#   gradient_step_per_epoch     : 2    (Flow-Factory default; needed for PPO ratio ≠ 1)
+#   gradient_accumulation_steps : auto -> (32×16)/(4×1)/2 = 64
+#     => 2 optimizer.step()/epoch, each uses 32×16/2 = 256 video samples
+#   max_epochs                  : 110  (220 optimizer.step total == TaRoS Wan1.3B)
+#
+# IMPORTANT: gradient_step_per_epoch MUST be ≥ 2.
+#   With =1, policy never updates within an epoch → ratio ≡ 1 → PPO clipping
+#   inactive → loss degenerates to vanilla policy gradient.
+#
+# Wall-clock budget (4 × H200, 1.3B model, full fine-tune):
+#   LoRA v1 baseline:        ~4.5 min/epoch × 110 epoch ≈ 8  hours
+#   Full (this, estimated):  ~11 min/epoch × 110 epoch  ≈ 20 hours (one overnight)
+#   (full backward is ~2-3× slower than LoRA due to grad_ckpt + full optimizer step)
+#
+# Memory budget (4 × H200 141GB each, FSDP2 shard across 4):
+#   Per-shard: model 0.65 GB + grad 0.65 GB + optim (Adam fp32) 3.9 GB ≈ 5.2 GB
+#   Activations (bf16 + grad_ckpt): ~15-25 GB depending on resolution
+#   Sampling tensors (offloaded to CPU): negligible during optimize
+#   => Total per H200: ~30-40 GB out of 141 GB. Plenty of headroom.
+#
+# Other deviations from `full/wan21/t2v.yaml`:
+#   - num_processes:        8  -> 4   (only 4 GPUs available)
+#   - model.model_name_or_path        (local Wan2.1-1.3B weights)
+#   - data.dataset_dir: pickscore -> vid_prompt   (DanceGRPO 50k video prompts)
+#   - scheduler.dynamics_type: Flow-SDE -> Dance-SDE
+#   - rewards: CLIP + PickScore -> VideoAlign (1:1:1, DanceGRPO-style static weights)
+#   - learning_rate: 1e-4 -> 5e-6     (TaRoS §5.2 standard, much smaller than template)
+#
+# NOTE: TaRoS algorithm-specific hyperparameters (τI, τII, β) are NOT used here.
+# Those control TaRoS's dynamic reward mixing (paper §4.2); the DanceGRPO baseline
+# we are reproducing uses static 1:1:1 weights (vq_coef/mq_coef/ta_coef below).
+
+# Environment Configuration
+launcher: "accelerate"  # Options: accelerate
+config_file: config/accelerate_configs/fsdp2.yaml  # [DIFF vs LoRA] FSDP2 for full fine-tune (matches DanceGRPO official)
+num_processes: 4  # [DIFF] 4 GPUs instead of 8 (overrides fsdp2.yaml's num_processes)
+main_process_port: 29500
+mixed_precision: "bf16"  # Options: no, fp16, bf16
+
+# Data Configuration
+data:
+  dataset_dir: "dataset/vid_prompt"  # DanceGRPO official 50k video prompts (vs. pickscore = T2I-only)
+  preprocessing_batch_size: 8  # Batch size for preprocessing
+  dataloader_num_workers: 16  # Number of workers for DataLoader
+  force_reprocess: true  # Force reprocessing of the dataset
+  cache_dir: "~/.cache/flow_factory/datasets" # Cache directory for preprocessed datasets
+  max_dataset_size: 1000  # Limit the maximum number of samples in the dataset
+  sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
+
+# Model Configuration
+model:
+  finetune_type: 'full' # [DIFF vs LoRA] full fine-tune (matches DanceGRPO/TaRoS official)
+  target_components: 'transformer' # Options: transformer (Wan2.1 & Wan2.2), transformer_2 (Wan2.2)
+  target_modules: "default" # Not used for `full`, kept to match template
+  model_name_or_path: "/aigc/posttrain/siyuanfu/models/Wan2.1"  # [DIFF] local Wan2.1-1.3B weights
+  model_type: "wan2_t2v"  # wan2_t2v, wan2_i2v, wan2_v2v
+  resume_path: null # Path to load previous checkpoint
+  resume_type: null # Options: lora, full, state. Null to auto-detect based on `finetune_type`
+
+log:
+  run_name: null  # Run name (auto: {model_type}_{finetune_type}_{trainer_type}_{timestamp})
+  project: "Flow-Factory"  # Project name for logging
+  logging_backend: "wandb"  # Options: wandb, swanlab, tensorboard, none
+  save_dir: "saves/"  # Directory to save model checkpoints and logs
+  save_freq: 10  # TaRoS short-run: 11 ckpts over 110 epoch (= 220 optimizer.step)
+  save_model_only: true  # Save only the model weights (full ckpt is ~2.6 GB each → ~30 GB total)
+
+# Training Configuration
+train:
+  # Trainer settings
+  trainer_type: 'grpo' # Options: 'grpo', 'nft', 'awm'
+  advantage_aggregation: 'gdpo' # Options: 'sum', 'gdpo'
+  # Clipping
+  clip_range: 1.0e-4  # PPO/GRPO clipping range (matches DanceGRPO `--clip_range 1e-4`)
+  adv_clip_range: 5.0  # Advantage clipping range (matches DanceGRPO `--adv_clip_max 5.0`)
+  # KL div
+  kl_type: 'v-based' # Options: 'x-based', 'v-based'
+  kl_beta: 0 # KL divergence coefficient. Set ~1e-2 for 'x-based' and ~1e-3 for 'v-based'.
+  ref_param_device: 'cuda' # Options: cpu, cuda
+
+  # Sampling settings
+  resolution: 256  # Can be int or [height, width]
+  num_frames: 5 # (F - 1) mod 4 == 0
+  num_inference_steps: 10  # Number of timesteps
+  guidance_scale: 5.0  # Guidance scale for sampling
+ 
+  # Batch and sampling  [SAME AS LoRA v1] TaRoS/DanceGRPO standard
+  per_device_batch_size: 1                # video-scale fwd granularity
+  group_size: 16                          # = TaRoS §5.2 standard
+  global_std: false                       # group-normalize per prompt (DanceGRPO style)
+  unique_sample_num_per_epoch: 32         # 8 prompts × 4 GPU
+  gradient_step_per_epoch: 2              # Flow-Factory default. Do NOT lower to 1: see header.
+  gradient_accumulation_steps: auto       # auto -> (32×16)/(4×1)/2 = 64 => 256 video / optimizer.step
+
+  # Optimization
+  learning_rate: 5.0e-6  # TaRoS §5.2 standard for Wan1.3B + DanceGRPO + VideoAlign
+  adam_weight_decay: 1.0e-4  # AdamW weight decay
+  adam_betas: [0.9, 0.999]  # AdamW betas
+  adam_epsilon: 1.0e-8  # AdamW epsilon
+  max_grad_norm: 1.0  # Max gradient norm for clipping
+
+  # EMA
+  ema_decay: 0.9  # EMA decay rate (0 to disable)
+  ema_update_interval: 2  # TaRoS short-run: 55 EMA updates over 110 epoch
+  ema_device: "cuda"  # Device to store EMA model (options: cpu, cuda)
+
+  # Gradient checkpointing
+  enable_gradient_checkpointing: true  # [DIFF vs LoRA] REQUIRED for full fine-tune (else OOM)
+  offload_samples_to_cpu: true  # Required for video models: per-sample tensors are GB-scale.
+
+  # Seed
+  seed: 42  # Random seed
+
+  # Training duration cap.  TaRoS §5.2: Wan1.3B trains for 220 optimizer.step.
+  # gradient_step_per_epoch=2 → 1 epoch == 2 optimizer.step() → 110 epoch = 220 step.
+  #   TaRoS Wan1.3B baseline (full, 8 H100):  220 step  (G=16, lr=5e-6)
+  #   Ours (4 H200, full):                    220 step  (110 epoch × 2 step/epoch)
+  # Each epoch processes 32 unique prompts × 16 rollouts = 512 video gens.
+  # First reward signal expected around epoch 15-25 (= step 30-50).
+  max_epochs: 110
+
+# Scheduler Configuration
+scheduler:
+  dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule (vs. Flow-SDE in t2v.yaml)
+  noise_level: 0.9  # Noise level for sampling
+  num_sde_steps: 1  # Number of noise steps
+  sde_steps: [1, 2, 3]  # Custom noise window, noise steps are randomly selected from this list during training
+  seed: 42  # Scheduler seed (for noise step selection)
+  flow_shift: 3.0 # 5.0 for 720P, 3.0 for 480P (from WanPipeline docstring)
+
+# Evaluation settings
+eval:
+  resolution: 480  # Evaluation resolution
+  num_frames: 13 # Evaluation frames
+  per_device_batch_size: 1  # Eval batch size
+  seed: 42  # Eval seed (defaults to training seed)
+  guidance_scale: 5.0  # Guidance scale for sampling
+  num_inference_steps: 28  # Number of eval timesteps
+  eval_freq: 10  # TaRoS short-run: 11 evals over 110 epoch (= 220 optimizer.step)
+
+# Reward Model Configuration  # [DIFF] VideoAlign (1:1:1) instead of CLIP + PickScore
+rewards:
+  - name: "videoalign"
+    reward_model: "videoalign"
+    weight: 1.0
+    batch_size: 1                # DanceGRPO calls reward() one video at a time
+    device: "cuda"
+    dtype: bfloat16
+    # ---- extra_kwargs (passed through to VideoAlignRewardModel) -----------
+    videoalign_dir: "/aigc/posttrain/siyuanfu/VideoAlign"   # the repo with inference.py + checkpoints/
+    checkpoint_dir: null         # default = {videoalign_dir}/checkpoints
+    vq_coef: 1.0
+    mq_coef: 1.0
+    ta_coef: 1.0
+    use_norm: true               # match DanceGRPO (z-score on)
+    video_fps: 15                # matches Wan2.1 generation fps
+    return_metrics: true         # expose VQ/MQ/TA in extra_info for logging
+
+# Optional Evaluation Reward Models
+# eval_rewards:
+#   - name: "text_alignment_2"
+#     reward_model: "CLIP"
+#     batch_size: 16
+#     device: "cuda"
+#     dtype: bfloat16
