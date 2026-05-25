@@ -1019,20 +1019,27 @@ class VideoAlignRewardModel(PointwiseRewardModel):
         mq_norm_list: Optional[List[float]] = None,
         ta_norm_list: Optional[List[float]] = None,
     ) -> None:
-        """Push per-call batch stats to the active wandb run.
+        """Push per-call mean stats to the active wandb run.
 
-        Logs three views of the reward, all under the ``reward/*`` namespace
-        with an INDEPENDENT step axis (``reward/_call``):
+        Logs three views of the reward (mean only -- see ``_mean`` for why no
+        std), all under the ``reward/*`` namespace with an INDEPENDENT step
+        axis (``reward/_call``):
 
-        * ``reward/{VQ,MQ,TA}_{mean,std}`` -- the TRAINING signal (this is
-          what GRPO actually optimizes; equals raw or z-scored depending on
+        * ``reward/{VQ,MQ,TA}_mean`` -- the TRAINING signal (this is what
+          GRPO actually optimizes; equals raw or z-scored depending on
           ``self.use_norm``).
-        * ``reward/{VQ,MQ,TA}_raw_{mean,std}`` -- always the RAW VideoAlign
-          reward (model logits, no z-score). Directly comparable to TaRoS
-          Table 4 and other published VideoAlign numbers.
-        * ``reward/{VQ,MQ,TA}_norm_{mean,std}`` -- always the z-SCORED
-          VideoAlign reward, using the fixed ``inference_config`` constants
-          from ``model_config.json``.
+        * ``reward/{VQ,MQ,TA}_raw_mean`` -- always the RAW VideoAlign reward
+          (model logits, no z-score). Directly comparable to TaRoS Table 4
+          and other published VideoAlign numbers.
+        * ``reward/{VQ,MQ,TA}_norm_mean`` -- always the z-SCORED VideoAlign
+          reward, using the fixed ``inference_config`` constants from
+          ``model_config.json``.
+
+        Per-dim std is intentionally NOT logged here because DanceGRPO's
+        ``batch_size=1`` makes every call see a single sample, forcing std
+        to be 0 (math, not a bug). Real batch/group-wise reward std is
+        already logged by the trainer as ``train/reward_videoalign_std`` /
+        ``train/reward_videoalign_group_std_*`` on the composite reward.
 
         Uses ``wandb.define_metric`` on first call so this never collides
         with the trainer's explicit step on ``train/*`` and ``eval/*`` panels.
@@ -1072,33 +1079,37 @@ class VideoAlignRewardModel(PointwiseRewardModel):
 
             self._reward_call_counter += 1
 
-            def _stats(xs: List[float]) -> tuple:
-                t = torch.tensor(xs, dtype=torch.float32)
-                return float(t.mean().item()), float(t.std(unbiased=False).item())
+            def _mean(xs: List[float]) -> float:
+                # Only log mean: with DanceGRPO's batch_size=1, every call sees
+                # a single sample, so a per-call std is mathematically 0 and
+                # carries no information. True batch/group reward std is logged
+                # by the trainer as `train/reward_videoalign_std` and
+                # `train/reward_videoalign_group_std_*`.
+                return float(torch.tensor(xs, dtype=torch.float32).mean().item())
 
-            vq_mean, vq_std = _stats(vq_list)
-            mq_mean, mq_std = _stats(mq_list)
-            ta_mean, ta_std = _stats(ta_list)
-            comp_mean = float(torch.tensor(composite_list, dtype=torch.float32).mean().item())
+            vq_mean = _mean(vq_list)
+            mq_mean = _mean(mq_list)
+            ta_mean = _mean(ta_list)
+            comp_mean = _mean(composite_list)
 
             payload = {
                 "reward/_call": self._reward_call_counter,
                 # Training signal (= raw or norm depending on use_norm config)
-                "reward/VQ_mean": vq_mean, "reward/VQ_std": vq_std,
-                "reward/MQ_mean": mq_mean, "reward/MQ_std": mq_std,
-                "reward/TA_mean": ta_mean, "reward/TA_std": ta_std,
+                "reward/VQ_mean": vq_mean,
+                "reward/MQ_mean": mq_mean,
+                "reward/TA_mean": ta_mean,
                 "reward/composite_local_mean": comp_mean,
             }
 
             # Raw (TaRoS-comparable) view, always logged when available
             if vq_raw_list is not None:
-                vq_raw_mean, vq_raw_std = _stats(vq_raw_list)
-                mq_raw_mean, mq_raw_std = _stats(mq_raw_list)
-                ta_raw_mean, ta_raw_std = _stats(ta_raw_list)
+                vq_raw_mean = _mean(vq_raw_list)
+                mq_raw_mean = _mean(mq_raw_list)
+                ta_raw_mean = _mean(ta_raw_list)
                 payload.update({
-                    "reward/VQ_raw_mean": vq_raw_mean, "reward/VQ_raw_std": vq_raw_std,
-                    "reward/MQ_raw_mean": mq_raw_mean, "reward/MQ_raw_std": mq_raw_std,
-                    "reward/TA_raw_mean": ta_raw_mean, "reward/TA_raw_std": ta_raw_std,
+                    "reward/VQ_raw_mean": vq_raw_mean,
+                    "reward/MQ_raw_mean": mq_raw_mean,
+                    "reward/TA_raw_mean": ta_raw_mean,
                     "reward/composite_raw_mean": (
                         self.vq_coef * vq_raw_mean
                         + self.mq_coef * mq_raw_mean
@@ -1108,13 +1119,13 @@ class VideoAlignRewardModel(PointwiseRewardModel):
 
             # Z-scored view, always logged when available
             if vq_norm_list is not None:
-                vq_n_mean, vq_n_std = _stats(vq_norm_list)
-                mq_n_mean, mq_n_std = _stats(mq_norm_list)
-                ta_n_mean, ta_n_std = _stats(ta_norm_list)
+                vq_n_mean = _mean(vq_norm_list)
+                mq_n_mean = _mean(mq_norm_list)
+                ta_n_mean = _mean(ta_norm_list)
                 payload.update({
-                    "reward/VQ_norm_mean": vq_n_mean, "reward/VQ_norm_std": vq_n_std,
-                    "reward/MQ_norm_mean": mq_n_mean, "reward/MQ_norm_std": mq_n_std,
-                    "reward/TA_norm_mean": ta_n_mean, "reward/TA_norm_std": ta_n_std,
+                    "reward/VQ_norm_mean": vq_n_mean,
+                    "reward/MQ_norm_mean": mq_n_mean,
+                    "reward/TA_norm_mean": ta_n_mean,
                     "reward/composite_norm_mean": (
                         self.vq_coef * vq_n_mean
                         + self.mq_coef * mq_n_mean
