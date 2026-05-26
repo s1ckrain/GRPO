@@ -1,24 +1,3 @@
-# Wan2.1-T2V-1.3B × DanceGRPO baseline × VideoAlign reward (LoRA).
-#
-# Target metrics (TaRoS Table 4, DanceGRPO+VideoAlign+3-dim, Wan1.3B):
-#   VQ 3.448 → 3.412 | MQ 0.2911 → 0.3022 | TA -1.914 → -1.172
-#
-# Quick reference (strict DanceGRPO + TaRoS alignment):
-#   train.num_frames    53     # TaRoS §5.2: 480×832×53 @ 15fps
-#   train.group_size    16     # TaRoS §5.2: G=16
-#   train.num_inference_steps  20   # DanceGRPO --sampling_steps 20
-#   train.learning_rate 5e-6   # TaRoS/DanceGRPO Wan2.1 official
-#   train.clip_range    1e-4   # DanceGRPO --clip_range 1e-4
-#   scheduler.noise_level 0.3  # DanceGRPO --eta 0.3
-#   scheduler.num_sde_steps 11 # DanceGRPO timestep_fraction=0.6 × (20-1) = 11.4 → 11
-#   scheduler.sde_steps [0..18] # DanceGRPO trains over all non-last transitions
-#   max_epochs          110    # 110 epoch × 2 opt.step = 220 step (TaRoS §5.2)
-#   eval.max_dataset_size  64  # bump to 128/1000 for final paper-style eval
-#
-# Budget (4×H200, strict DanceGRPO alignment):
-#   per-epoch: sampling ~20min + reward 3min + training ~38min = ~61min
-#   110 epoch + 10 eval × 22min = ~115h ≈ 4.8 days
-
 # Environment Configuration
 launcher: "accelerate"
 config_file: config/deepspeed/deepspeed_zero2.yaml
