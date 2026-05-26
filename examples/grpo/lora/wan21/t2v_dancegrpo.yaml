@@ -3,18 +3,21 @@
 # Target metrics (TaRoS Table 4, DanceGRPO+VideoAlign+3-dim, Wan1.3B):
 #   VQ 3.448 → 3.412 | MQ 0.2911 → 0.3022 | TA -1.914 → -1.172
 #
-# Quick reference (commonly tweaked knobs):
-#   train.num_frames    49     # min 41 to keep VideoAlign motion signal > v1 floor
-#   train.group_size    16     # aligned with TaRoS G=16 (was 8 before sparse-SDE compensation)
-#   train.num_inference_steps  16   # train w/ fewer steps (eval uses 50); save 20% sampling time
-#   train.learning_rate 1e-5   # ×2 vs TaRoS to compensate sparse-SDE (we train 6/16 vs DGP 12/20)
-#   scheduler.num_sde_steps  6  # 6/16 SDE transitions trained per rollout (DanceGRPO uses 12/20=60%)
+# Quick reference (strict DanceGRPO + TaRoS alignment):
+#   train.num_frames    53     # TaRoS §5.2: 480×832×53 @ 15fps
+#   train.group_size    16     # TaRoS §5.2: G=16
+#   train.num_inference_steps  20   # DanceGRPO --sampling_steps 20
+#   train.learning_rate 5e-6   # TaRoS/DanceGRPO Wan2.1 official
+#   train.clip_range    1e-4   # DanceGRPO --clip_range 1e-4
+#   scheduler.noise_level 0.3  # DanceGRPO --eta 0.3
+#   scheduler.num_sde_steps 11 # DanceGRPO timestep_fraction=0.6 × (20-1) = 11.4 → 11
+#   scheduler.sde_steps [0..18] # DanceGRPO trains over all non-last transitions
 #   max_epochs          110    # 110 epoch × 2 opt.step = 220 step (TaRoS §5.2)
 #   eval.max_dataset_size  64  # bump to 128/1000 for final paper-style eval
 #
-# Budget (4×H200, ~3 days):
-#   per-epoch: sampling 15min + reward 3min + training 20min = ~38min
-#   110 epoch + 10 eval × 11min = ~72h ≈ 3 days
+# Budget (4×H200, strict DanceGRPO alignment):
+#   per-epoch: sampling ~20min + reward 3min + training ~38min = ~61min
+#   110 epoch + 10 eval × 22min = ~115h ≈ 4.8 days
 
 # Environment Configuration
 launcher: "accelerate"
@@ -60,75 +63,69 @@ train:
                                 # 与 DanceGRPO 单 composite reward 的 group-relative 不一致;sum + global_std=false
                                 # 严格等价 DanceGRPO/fastvideo/train_grpo_wan_2_1.py 的 per-group normalize
 
-  clip_range: 2.0e-4  # [P1-FIX] 1e-4→2e-4: 配合 lr×2,否则 ratio 立刻撞 clip 边界饱和;
-                      # 实测之前 clip_frac_total 已经到 0.9+,说明 1e-4 太紧
-  adv_clip_range: 5.0
+  clip_range: 1.0e-4  # DanceGRPO official `--clip_range 1e-4`
+  adv_clip_range: 5.0  # DanceGRPO official `--adv_clip_max 5.0`
 
   kl_type: 'v-based'  # Options: 'x-based', 'v-based'
   kl_beta: 0  # ~1e-2 for x-based, ~1e-3 for v-based, 0 disables
   ref_param_device: 'cuda'  # Options: cpu, cuda
 
   # Sampling
-  resolution: [480, 832]
-  num_frames: 49  # must satisfy (num_frames - 1) % 4 == 0
-  num_inference_steps: 16  # [P1-FIX] 20→16: 节省 20% sampling 时间(占总时长 78%),给 num_sde_steps↑留 buffer
-  guidance_scale: 5.0
+  resolution: [480, 832]  # TaRoS §5.2
+  num_frames: 53  # TaRoS §5.2 (must satisfy (num_frames - 1) % 4 == 0; 53→14 latent depth)
+  num_inference_steps: 20  # DanceGRPO `--sampling_steps 20`
+  guidance_scale: 5.0  # DanceGRPO `--cfg_infer 5.0`
 
   # Batch
   per_device_batch_size: 1
-  group_size: 16  # [P1-FIX] 8→16: 严格对齐 TaRoS G=16;group_std 估计方差减半,advantage 信号更干净
+  group_size: 16  # TaRoS G=16
   global_std: false
-  unique_sample_num_per_epoch: 16  # [P1-FIX] 32→16: 配合 group_size×2,保持 total samples=256/epoch 不变
-                                   # (16 prompt × 16 group = 256 samples,与原 32×8=256 同总量)
+  unique_sample_num_per_epoch: 16  # 16 prompt × 16 group = 256 samples/epoch
+                                   # (4 GPU × 64 batch = 256, single rank holds whole group via group_contiguous)
   gradient_step_per_epoch: 2  # MUST be >= 2 (else ratio≡1, PPO clipping inactive)
   gradient_accumulation_steps: auto
 
   # Optimization
-  learning_rate: 1.0e-5  # [P1-FIX] 5e-6→1e-5: 配合稀疏 SDE 训练(1/16 step)的累积不足,
-                         # 实测之前 28 epoch grad_norm 仅 ~5e-4,LoRA 累计移动 ~1e-7 几乎等于不学;
-                         # ×2 补偿后单步移动量翻倍,clip_range 同步放大才不会立刻饱和
-  adam_weight_decay: 1.0e-4
+  learning_rate: 5.0e-6  # TaRoS §5.2 / DanceGRPO Wan official
+  adam_weight_decay: 1.0e-4  # DanceGRPO `--weight_decay 0.0001`
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
-  max_grad_norm: 1.0
+  max_grad_norm: 1.0  # DanceGRPO `--max_grad_norm 1.0`
 
-  # EMA
-  ema_decay: 0.95  # [P1-FIX] 0.99→0.95: 0.99 在 110 epoch 训练里 half-life 太长(>100 epoch),
-                   # eval 始终反映 pretrained 权重;0.95 半衰期 28 epoch,训练末期 EMA 反映 ~94% 训练权重
+  # EMA (DanceGRPO 官方无 EMA,Flow-Factory 默认开 EMA 评估;0.95+interval=2 在 110 epoch 内合理)
+  ema_decay: 0.95
   ema_update_interval: 2
   ema_device: "cuda"  # Options: cpu, cuda
 
   # Memory
-  enable_gradient_checkpointing: true  # REQUIRED at 480×832×49; backward OOMs without it
+  enable_gradient_checkpointing: true  # REQUIRED at 480×832×53; backward OOMs without it
   offload_samples_to_cpu: true  # required for video models (per-sample tensors are GB-scale)
 
   seed: 42
   max_epochs: 110  # 220 optimizer steps (TaRoS §5.2)
 
-# Scheduler Configuration
+# Scheduler Configuration (strict DanceGRPO alignment)
 scheduler:
-  dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule
-  noise_level: 0.3  # [P0-FIX] 0.9→0.3: 严格对齐 DanceGRPO `finetune_wan_2_1_grpo.sh --eta 0.3`;
-                    # 0.9 让 SDE 噪声主导 group 方差,policy 信号被淹没,且 sample 质量整体偏低
-  num_sde_steps: 6  # [P1-FIX] 1→6: 每 epoch 训 6 个 SDE transition,DanceGRPO 用 12/20(60%);
-                    # 我们 6/16(37.5%)是 3 天预算下能稳进的最大值,training 时长 ×6 但 sampling 不变,
-                    # 总 epoch 时长 24min→40min,110 epoch ≈ 74h 约 3.1 天
-  sde_steps: [1, 2, 3, 4, 5, 6]  # 跳过索引 0(σ=1.0 数值不稳),覆盖 denoising 前 37.5% 高噪声区段;
-                                 # num_sde_steps==len(sde_steps) 时所有 6 步每 epoch 都被训练(确定性)
+  dynamics_type: "Dance-SDE"  # DanceGRPO sde_solver=True
+  noise_level: 0.3  # DanceGRPO `--eta 0.3`
+  num_sde_steps: 11  # DanceGRPO `timestep_fraction=0.6` × (sampling_steps-1) = 0.6 × 19 = 11.4 → 11
+                     # 每 epoch 框架会从 sde_steps 中随机抽 11 个(epoch-level 随机,DanceGRPO 是 sample-level);
+                     # 这 11 步是 SDE 注入+反传,其余 8 步是 ODE(Flow-Factory 把 SDE 注入和训练耦合)
+  sde_steps: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]  # all 19 non-last
+                                                                                  # (DanceGRPO --ignore_last 也是丢最后一步)
   seed: 42
-  flow_shift: 3.0  # 5.0 for 720P, 3.0 for 480P
+  flow_shift: 3.0  # 5.0 for 720P, 3.0 for 480P (DanceGRPO `--shift 3`)
 
 # Evaluation
 eval:
   resolution: [480, 832]
-  num_frames: 49  # keep in sync with train.num_frames
+  num_frames: 53  # keep in sync with train.num_frames (TaRoS §5.2)
   per_device_batch_size: 1
   seed: 42
   guidance_scale: 5.0
-  num_inference_steps: 50
+  num_inference_steps: 50  # eval 用 50 步保画质(TaRoS / DanceGRPO 评测惯例)
   eval_freq: 11  # 10 evals over 110 epoch
-  max_dataset_size: 64  # [P1-FIX] 128→64: 每次 eval 从 22min→11min,10 次 eval 总省 ~2h;
-                        # 论文级评测前再 bump 到 128 或 1000
+  max_dataset_size: 64  # 节省 eval 时间;论文级评测前再 bump 到 128/1000
 
 # Reward Model Configuration  [DIFF] VideoAlign (1:1:1) instead of CLIP+PickScore
 rewards:
