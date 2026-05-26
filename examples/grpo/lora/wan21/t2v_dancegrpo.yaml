@@ -5,10 +5,16 @@
 #
 # Quick reference (commonly tweaked knobs):
 #   train.num_frames    49     # min 41 to keep VideoAlign motion signal > v1 floor
-#   train.group_size    8      # TaRoS=16, DanceGRPO=12; we use 8 for 2× sampling speed
-#   train.num_inference_steps  20   # halve to 10 for another 2× sampling speed
+#   train.group_size    16     # aligned with TaRoS G=16 (was 8 before sparse-SDE compensation)
+#   train.num_inference_steps  16   # train w/ fewer steps (eval uses 50); save 20% sampling time
+#   train.learning_rate 1e-5   # ×2 vs TaRoS to compensate sparse-SDE (we train 6/16 vs DGP 12/20)
+#   scheduler.num_sde_steps  6  # 6/16 SDE transitions trained per rollout (DanceGRPO uses 12/20=60%)
 #   max_epochs          110    # 110 epoch × 2 opt.step = 220 step (TaRoS §5.2)
-#   eval.max_dataset_size  128  # bump to 1000 for final paper-style eval
+#   eval.max_dataset_size  64  # bump to 128/1000 for final paper-style eval
+#
+# Budget (4×H200, ~3 days):
+#   per-epoch: sampling 15min + reward 3min + training 20min = ~38min
+#   110 epoch + 10 eval × 11min = ~72h ≈ 3 days
 
 # Environment Configuration
 launcher: "accelerate"
@@ -54,7 +60,8 @@ train:
                                 # 与 DanceGRPO 单 composite reward 的 group-relative 不一致;sum + global_std=false
                                 # 严格等价 DanceGRPO/fastvideo/train_grpo_wan_2_1.py 的 per-group normalize
 
-  clip_range: 1.0e-4
+  clip_range: 2.0e-4  # [P1-FIX] 1e-4→2e-4: 配合 lr×2,否则 ratio 立刻撞 clip 边界饱和;
+                      # 实测之前 clip_frac_total 已经到 0.9+,说明 1e-4 太紧
   adv_clip_range: 5.0
 
   kl_type: 'v-based'  # Options: 'x-based', 'v-based'
@@ -64,27 +71,30 @@ train:
   # Sampling
   resolution: [480, 832]
   num_frames: 49  # must satisfy (num_frames - 1) % 4 == 0
-  num_inference_steps: 20
+  num_inference_steps: 16  # [P1-FIX] 20→16: 节省 20% sampling 时间(占总时长 78%),给 num_sde_steps↑留 buffer
   guidance_scale: 5.0
 
   # Batch
   per_device_batch_size: 1
-  group_size: 8
+  group_size: 16  # [P1-FIX] 8→16: 严格对齐 TaRoS G=16;group_std 估计方差减半,advantage 信号更干净
   global_std: false
-  unique_sample_num_per_epoch: 32
+  unique_sample_num_per_epoch: 16  # [P1-FIX] 32→16: 配合 group_size×2,保持 total samples=256/epoch 不变
+                                   # (16 prompt × 16 group = 256 samples,与原 32×8=256 同总量)
   gradient_step_per_epoch: 2  # MUST be >= 2 (else ratio≡1, PPO clipping inactive)
   gradient_accumulation_steps: auto
 
   # Optimization
-  learning_rate: 5.0e-6
+  learning_rate: 1.0e-5  # [P1-FIX] 5e-6→1e-5: 配合稀疏 SDE 训练(1/16 step)的累积不足,
+                         # 实测之前 28 epoch grad_norm 仅 ~5e-4,LoRA 累计移动 ~1e-7 几乎等于不学;
+                         # ×2 补偿后单步移动量翻倍,clip_range 同步放大才不会立刻饱和
   adam_weight_decay: 1.0e-4
   adam_betas: [0.9, 0.999]
   adam_epsilon: 1.0e-8
   max_grad_norm: 1.0
 
   # EMA
-  ema_decay: 0.99  # [P0-FIX] 0.9→0.99: ema_decay=0.9 在 update_interval=2 下,2 步后旧权重贡献只剩 0.81,
-                   # 几乎等于裸 policy,失去稳定 eval 的意义;DanceGRPO 使用 0.999,Flow-GRPO 也用 ≥0.99
+  ema_decay: 0.95  # [P1-FIX] 0.99→0.95: 0.99 在 110 epoch 训练里 half-life 太长(>100 epoch),
+                   # eval 始终反映 pretrained 权重;0.95 半衰期 28 epoch,训练末期 EMA 反映 ~94% 训练权重
   ema_update_interval: 2
   ema_device: "cuda"  # Options: cpu, cuda
 
@@ -100,8 +110,11 @@ scheduler:
   dynamics_type: "Dance-SDE"  # [DIFF] DanceGRPO noise schedule
   noise_level: 0.3  # [P0-FIX] 0.9→0.3: 严格对齐 DanceGRPO `finetune_wan_2_1_grpo.sh --eta 0.3`;
                     # 0.9 让 SDE 噪声主导 group 方差,policy 信号被淹没,且 sample 质量整体偏低
-  num_sde_steps: 1  # Keep Flow-Factory sparse-SDE training; only one SDE transition is trained per rollout.
-  sde_steps: [1, 2, 3]  # Randomly select one early denoising step from this window during training.
+  num_sde_steps: 6  # [P1-FIX] 1→6: 每 epoch 训 6 个 SDE transition,DanceGRPO 用 12/20(60%);
+                    # 我们 6/16(37.5%)是 3 天预算下能稳进的最大值,training 时长 ×6 但 sampling 不变,
+                    # 总 epoch 时长 24min→40min,110 epoch ≈ 74h 约 3.1 天
+  sde_steps: [1, 2, 3, 4, 5, 6]  # 跳过索引 0(σ=1.0 数值不稳),覆盖 denoising 前 37.5% 高噪声区段;
+                                 # num_sde_steps==len(sde_steps) 时所有 6 步每 epoch 都被训练(确定性)
   seed: 42
   flow_shift: 3.0  # 5.0 for 720P, 3.0 for 480P
 
@@ -114,7 +127,8 @@ eval:
   guidance_scale: 5.0
   num_inference_steps: 50
   eval_freq: 11  # 10 evals over 110 epoch
-  max_dataset_size: 128  # in-loop eval; bump to 1000 for final paper-style eval
+  max_dataset_size: 64  # [P1-FIX] 128→64: 每次 eval 从 22min→11min,10 次 eval 总省 ~2h;
+                        # 论文级评测前再 bump 到 128 或 1000
 
 # Reward Model Configuration  [DIFF] VideoAlign (1:1:1) instead of CLIP+PickScore
 rewards:
