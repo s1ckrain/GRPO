@@ -99,6 +99,7 @@ eval:
   guidance_scale: 5.0  # Guidance scale for sampling
   num_inference_steps: 28  # Number of eval timesteps
   eval_freq: 20  # Eval frequency in epochs (0 to disable)
+  max_dataset_size: 64  # Limit eval samples to keep periodic evaluation fast
 
 # Reward Model Configuration
 rewards:
