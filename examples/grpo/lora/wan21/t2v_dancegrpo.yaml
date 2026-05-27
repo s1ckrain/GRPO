@@ -10,8 +10,14 @@ data:
   dataset_dir: "dataset/vid_prompt"  # [DIFF] DanceGRPO 50k video prompts
   preprocessing_batch_size: 8
   dataloader_num_workers: 16
-  force_reprocess: true
-  cache_dir: "~/.cache/flow_factory/datasets"
+  # First run: force_reprocess=true will (re)build cache at cache_dir.
+  # Subsequent runs: set force_reprocess=false to reuse the cache; loader auto-
+  # rebuilds only when the fingerprint changes or the cache dir is missing
+  # (data_utils/loader.py:110). cache_dir points to a persistent location under
+  # /aigc/posttrain/siyuanfu so the cache survives pod restarts (default
+  # ~/.cache/flow_factory/datasets sits on ephemeral home and gets wiped).
+  force_reprocess: false
+  cache_dir: "/aigc/posttrain/siyuanfu/.cache/flow_factory/datasets"
   max_dataset_size: 1000  # train split cap; test split uses eval.max_dataset_size
   sampler_type: "auto"  # Options: auto, distributed_k_repeat, group_contiguous
 
@@ -111,7 +117,12 @@ rewards:
   - name: "videoalign"
     reward_model: "videoalign"
     weight: 1.0
-    batch_size: 1
+    # batch_size: VideoAlign.__call__ internally for-loops over samples and calls
+    # inferencer.reward([single_video], [single_prompt]) per item; Qwen2-VL reward
+    # has no batch-dependent ops (no BN, no dropout, torch.no_grad), so values are
+    # bit-exact across batch_size choices. Setting 8 to match flow_factory defaults
+    # and to be ready in case inferencer.reward is later vectorized.
+    batch_size: 8
     device: "cuda"
     dtype: bfloat16
     videoalign_dir: "/aigc/posttrain/siyuanfu/VideoAlign"
