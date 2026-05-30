@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/aigc/opensourcemodel/Qwen3-VL-32B-Instruct-FP8}"
+MODEL_PATH="${MODEL_PATH:-/aigc/opensourcemodel/Qwen3-VL-8B-Instruct}"
 if [[ -z "${MODEL_PATH}" ]]; then
   echo "MODEL_PATH is empty. Set it to your Qwen3-VL-72B path before running." >&2
   exit 1
