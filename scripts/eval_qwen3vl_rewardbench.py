@@ -489,8 +489,20 @@ def calculate_and_save_accuracy(df_pair_pred: pd.DataFrame, out_dir: Path) -> Di
         )
         human = df_pair_pred[attr].map(LABEL_MAP)
         if human.isna().any():
-            bad = sorted(set(df_pair_pred.loc[human.isna(), attr].astype(str)))
-            raise ValueError(f"unexpected labels in {attr}: {bad}")
+            bad_values = df_pair_pred.loc[human.isna(), attr]
+            if bad_values.isna().all():
+                logger.warning(
+                    "skipping %s accuracy because the human-label column is empty/NaN",
+                    attr,
+                )
+                continue
+            bad = sorted(set(bad_values.astype(str)))
+            logger.warning(
+                "skipping %s accuracy because it contains unsupported labels: %s",
+                attr,
+                bad,
+            )
+            continue
 
         results[f"{attr} Accuracy"] = {
             "with_ties": calc_accuracy_with_ties(human.astype(int), df_pair_pred[pred_col]),
