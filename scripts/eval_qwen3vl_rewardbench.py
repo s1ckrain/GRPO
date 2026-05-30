@@ -95,7 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--anno-path", default=None)
     parser.add_argument("--out-dir", default="qwen3vl-videogen-rewardbench-output")
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=100)
     parser.add_argument(
         "--resume",
         action=argparse.BooleanOptionalAction,
