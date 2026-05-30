@@ -37,6 +37,8 @@ _REWARD_MODEL_REGISTRY: Dict[str, str] = {
     'rational_rewards_edit': 'flow_factory.rewards.rational_rewards_edit.RationalRewardsEditRewardModel',
     # Video reward model wrapping KwaiVGI/VideoReward, follows DanceGRPO call pattern.
     'videoalign': 'flow_factory.rewards.videoalign.VideoAlignRewardModel',
+    # Remote Qwen3-VL VQ/MQ/TA video judge. The 72B model runs in a separate server.
+    'qwen3vl_video': 'flow_factory.rewards.qwen3vl_video.Qwen3VLVideoRewardModel',
 }
 _REWARD_MODEL_REGISTRY = {k.lower(): v for k, v in _REWARD_MODEL_REGISTRY.items()}
 
