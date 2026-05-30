@@ -440,7 +440,7 @@ class Qwen3VLJudge:
                 parsed_json=parsed,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("failed to score %s for %s: %s", dim, video_path, e)
+            logger.exception("failed to score %s for %s: %s", dim, video_path, e)
             raw_score = float(fallback_value)
             return ScoreResult(
                 raw_score=raw_score,
@@ -542,6 +542,23 @@ class Qwen3VLJudge:
             video_kwargs = result[2] if isinstance(result[2], dict) else {}
         else:
             raise ValueError(f"unexpected process_vision_info result length: {len(result)}")
+
+        # Qwen3-VL returns each video as (video_tensor, metadata) when
+        # return_video_metadata=True.  The processor expects the tensors under
+        # `videos` and the metadata separately under `video_metadata`.
+        if video_inputs:
+            first_video = video_inputs[0]
+            if (
+                isinstance(first_video, tuple)
+                and len(first_video) == 2
+                and not isinstance(video_kwargs.get("video_metadata"), list)
+            ):
+                videos, video_metadata = zip(*video_inputs)
+                video_inputs = list(videos)
+                video_kwargs["video_metadata"] = list(video_metadata)
+                # qwen-vl-utils already resized frames while fetching videos.
+                # Avoid a second processor resize pass on preprocessed tensors.
+                video_kwargs.setdefault("do_resize", False)
         return image_inputs, video_inputs, video_kwargs
 
 
