@@ -128,7 +128,12 @@ def parse_args() -> argparse.Namespace:
         default="bfloat16",
         choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"],
     )
-    parser.add_argument("--device-map", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--device-map-mode",
+        default="auto",
+        choices=["auto", "single", "none", "balanced", "balanced_low_0", "sequential"],
+        help="Direct backend device map mode. auto is safest for large/meta-loaded models.",
+    )
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--attn-implementation",

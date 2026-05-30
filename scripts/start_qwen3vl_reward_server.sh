@@ -13,6 +13,7 @@
 #   DTYPE                default: bfloat16
 #   PROMPT_DIR           default: /Users/siyuan.fu/fsy/posttrain/prompts
 #   ATTN_IMPLEMENTATION  default: auto; uses flash_attention_2 if available, otherwise sdpa
+#   DEVICE_MAP_MODE      default: auto; use single to force all weights onto DEVICE
 #   MAX_NEW_TOKENS       default: 1024
 #   CACHE_SIZE           default: 512
 #   VIDEO_FPS            default: 1.0 for judge frame sampling, independent of generated mp4 fps
@@ -33,6 +34,7 @@ DEVICE="${DEVICE:-cuda:4}"
 DTYPE="${DTYPE:-bfloat16}"
 PROMPT_DIR="${PROMPT_DIR:-/aigc/posttrain/siyuanfu/prompts}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-auto}"
+DEVICE_MAP_MODE="${DEVICE_MAP_MODE:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 CACHE_SIZE="${CACHE_SIZE:-512}"
 VIDEO_FPS="${VIDEO_FPS:-1.0}"
@@ -47,6 +49,7 @@ exec python "${SCRIPT_DIR}/qwen3vl_reward_server.py" \
   --dtype "${DTYPE}" \
   --prompt-dir "${PROMPT_DIR}" \
   --attn-implementation "${ATTN_IMPLEMENTATION}" \
+  --device-map-mode "${DEVICE_MAP_MODE}" \
   --max-new-tokens "${MAX_NEW_TOKENS}" \
   --cache-size "${CACHE_SIZE}" \
   --video-fps "${VIDEO_FPS}" \

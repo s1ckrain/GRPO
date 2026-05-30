@@ -312,17 +312,31 @@ class Qwen3VLJudge:
         attn_implementation = self._resolve_attn_implementation(args.attn_implementation)
         if attn_implementation:
             model_kwargs["attn_implementation"] = attn_implementation
-        if args.device_map:
-            model_kwargs["device_map"] = {"": self.device}
+        device_map = self._resolve_device_map(args.device_map_mode)
+        if device_map is not None:
+            model_kwargs["device_map"] = device_map
 
         model = AutoModelForImageTextToText.from_pretrained(
             self.model_path,
             **model_kwargs,
         )
-        if not args.device_map:
+        if device_map is None:
             model.to(self.device)
         model.eval()
         return processor, model, process_vision_info
+
+    def _resolve_device_map(self, mode: str):
+        value = str(mode or "auto").lower()
+        if value in {"none", "false", "off"}:
+            return None
+        if value in {"auto", "balanced", "balanced_low_0", "sequential"}:
+            return value
+        if value in {"single", "cuda", "device"}:
+            return {"": self.device}
+        raise ValueError(
+            "--device-map-mode must be one of auto, single, none, balanced, "
+            f"balanced_low_0, sequential; got {mode!r}"
+        )
 
     def _resolve_attn_implementation(self, requested: str) -> Optional[str]:
         value = str(requested or "").lower()
@@ -691,7 +705,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--dtype", default="bfloat16", choices=["bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
-    parser.add_argument("--device-map", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--device-map-mode",
+        default="auto",
+        choices=["auto", "single", "none", "balanced", "balanced_low_0", "sequential"],
+        help="How transformers places Qwen3-VL weights. auto is safest for large/meta-loaded models; "
+        "single maps the whole model to --device; none loads on CPU then calls .to(--device).",
+    )
     parser.add_argument("--trust-remote-code", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--attn-implementation",
