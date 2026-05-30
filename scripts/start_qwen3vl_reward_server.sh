@@ -20,6 +20,7 @@
 #
 # Extra arguments are forwarded to qwen3vl_reward_server.py.
 
+export CUDA_VISIBLE_DEVICES=4
 set -euo pipefail
 
 MODEL_PATH="${MODEL_PATH:-/aigc/opensourcemodel/Qwen3-VL-8B-Instruct}"
