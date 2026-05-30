@@ -29,7 +29,7 @@ fi
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-18080}"
-DEVICE="${DEVICE:-cuda:0}"
+DEVICE="${DEVICE:-cuda:4}"
 DTYPE="${DTYPE:-bfloat16}"
 PROMPT_DIR="${PROMPT_DIR:-/aigc/posttrain/siyuanfu/prompts}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-auto}"
