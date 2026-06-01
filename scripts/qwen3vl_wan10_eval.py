@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-generate",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Skip Wan generation and score an existing videos_meta.csv.",
     )
 
