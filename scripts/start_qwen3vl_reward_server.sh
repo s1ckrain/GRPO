@@ -23,7 +23,7 @@
 export CUDA_VISIBLE_DEVICES=1
 set -euo pipefail
 
-MODEL_PATH="${MODEL_PATH:-/aigc/opensourcemodel/Qwen3-VL-32B-Instruct}"
+MODEL_PATH="${MODEL_PATH:-/aigc/posttrain/siyuanfu/models/Qwen3-VL-32B-Instruct}"
 if [[ -z "${MODEL_PATH}" ]]; then
   echo "MODEL_PATH is empty. Set it to your Qwen3-VL-72B path before running." >&2
   exit 1
