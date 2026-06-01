@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(root / "GRPO/qwen3vl-wan10-eval"),
+        default=str(root / "GRPO/qwen3vl-wan10-2fps"),
         help="Output directory for generated videos and score CSVs.",
     )
     parser.add_argument(
@@ -126,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-generate",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Skip Wan generation and score an existing videos_meta.csv.",
     )
 
