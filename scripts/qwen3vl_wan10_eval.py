@@ -100,7 +100,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(root / "GRPO/qwen3vl-wan10-1fps"),
+        default=str(root / "GRPO/qwen3vl-1fps"),
         help="Output directory for generated videos and score CSVs.",
     )
     parser.add_argument(
