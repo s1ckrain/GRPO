@@ -40,6 +40,9 @@ pd = None
 requests = None
 tqdm = None
 
+REQUIRED_METRIC_KEYS = ("VQ", "MQ", "TA", "composite")
+REQUIRED_SCORE_COLUMNS = ("reward_VQ", "reward_MQ", "reward_TA", "reward_Overall")
+
 
 def default_posttrain_root() -> Path:
     return Path(__file__).resolve().parents[2]
@@ -260,7 +263,13 @@ class QwenServerClient:
                 metrics = data.get("metrics")
                 if not isinstance(metrics, list) or len(metrics) != 1:
                     raise RuntimeError(f"invalid metrics from server: {data}")
-                return metrics[0]
+                metric = metrics[0]
+                missing_keys = [key for key in REQUIRED_METRIC_KEYS if key not in metric]
+                if missing_keys:
+                    raise RuntimeError(
+                        f"Qwen reward server response missing metric keys {missing_keys}: {metric}"
+                    )
+                return metric
             except Exception as e:  # noqa: BLE001
                 last_err = e
                 if attempt + 1 >= self.retries:
@@ -285,6 +294,32 @@ def load_existing_scores(path: Path):
     return pd_mod.read_csv(path)
 
 
+def split_complete_existing_scores(existing):
+    if existing.empty:
+        return set(), []
+    if "video_id" not in existing.columns:
+        logger.warning("existing score CSV has no video_id column; rescoring all rows")
+        return set(), []
+
+    missing_columns = [col for col in REQUIRED_SCORE_COLUMNS if col not in existing.columns]
+    if missing_columns:
+        logger.warning(
+            "existing score CSV missing required columns %s; rescoring all rows",
+            missing_columns,
+        )
+        return set(), []
+
+    complete_mask = existing[list(REQUIRED_SCORE_COLUMNS)].notna().all(axis=1)
+    complete = existing[complete_mask].copy()
+    incomplete_count = int((~complete_mask).sum())
+    if incomplete_count:
+        logger.warning(
+            "existing score CSV has %s incomplete row(s); rescoring those rows",
+            incomplete_count,
+        )
+    return set(complete["video_id"].astype(str)), complete.to_dict("records")
+
+
 def metric_to_row(meta_row: Mapping[str, Any], metric: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "video_id": meta_row["video_id"],
@@ -293,10 +328,10 @@ def metric_to_row(meta_row: Mapping[str, Any], metric: Mapping[str, Any]) -> Dic
         "seed": int(meta_row["seed"]),
         "prompt": meta_row["prompt"],
         "video_path": meta_row["video_path"],
-        "reward_VQ": float(metric.get("VQ", 0.0)),
-        "reward_MQ": float(metric.get("MQ", 0.0)),
-        "reward_TA": float(metric.get("TA", 0.0)),
-        "reward_Overall": float(metric.get("composite", 0.0)),
+        "reward_VQ": float(metric["VQ"]),
+        "reward_MQ": float(metric["MQ"]),
+        "reward_TA": float(metric["TA"]),
+        "reward_Overall": float(metric["composite"]),
         "score_scale": metric.get("score_scale", "raw"),
         "errors": json.dumps(metric.get("errors", {}), ensure_ascii=False),
     }
@@ -336,9 +371,8 @@ def score_videos(args: argparse.Namespace, meta_csv: Path) -> Path:
     existing = load_existing_scores(scores_csv)
     done_ids = set()
     rows: List[Dict[str, Any]] = []
-    if not args.no_resume_score and not existing.empty and "video_id" in existing.columns:
-        done_ids = set(existing["video_id"].astype(str))
-        rows = existing.to_dict("records")
+    if not args.no_resume_score and not existing.empty:
+        done_ids, rows = split_complete_existing_scores(existing)
         logger.info("resuming Qwen scores: %s existing rows", len(done_ids))
 
     client = QwenServerClient(args)
