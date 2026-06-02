@@ -33,7 +33,7 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-18080}"
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-bfloat16}"
-PROMPT_DIR="${PROMPT_DIR:-/aigc/posttrain/siyuanfu/prompts}"
+PROMPT_DIR="${PROMPT_DIR:-/aigc/posttrain/siyuanfu/GRPO/prompts}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-auto}"
 DEVICE_MAP_MODE="${DEVICE_MAP_MODE:-auto}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
@@ -42,7 +42,7 @@ VIDEO_FPS="${VIDEO_FPS:-2.0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-exec python "${SCRIPT_DIR}/qwen3vl_reward_server.py" \
+exec python "${SCRIPT_DIR}/server.py" \
   --model-path "${MODEL_PATH}" \
   --host "${HOST}" \
   --port "${PORT}" \

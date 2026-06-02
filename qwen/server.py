@@ -224,6 +224,7 @@ def make_cache_key(
     vq_coef: float,
     mq_coef: float,
     ta_coef: float,
+    dimensions: Tuple[str, ...],
 ) -> str:
     h = hashlib.sha256()
     h.update(video_b64.encode("utf-8"))
@@ -233,6 +234,8 @@ def make_cache_key(
     h.update(score_scale.encode("utf-8"))
     h.update(b"\0")
     h.update(f"{vq_coef:.12g},{mq_coef:.12g},{ta_coef:.12g}".encode("utf-8"))
+    h.update(b"\0")
+    h.update(",".join(sorted(dimensions)).encode("utf-8"))
     return h.hexdigest()
 
 
@@ -364,13 +367,14 @@ class Qwen3VLJudge:
         score_scale: str,
         fallback_value: float,
         return_responses: bool,
+        dimensions: Tuple[str, ...] = ("VQ", "MQ", "TA"),
     ) -> Dict[str, Any]:
         raw: Dict[str, float] = {}
         scaled: Dict[str, float] = {}
         responses: Dict[str, Any] = {}
         errors: Dict[str, str] = {}
 
-        for dim in ("VQ", "MQ", "TA"):
+        for dim in dimensions:
             result = self._score_dimension(
                 dim=dim,
                 video_path=video_path,
@@ -389,21 +393,16 @@ class Qwen3VLJudge:
                     "error": result.error,
                 }
 
-        composite = (
-            float(vq_coef) * scaled["VQ"]
-            + float(mq_coef) * scaled["MQ"]
-            + float(ta_coef) * scaled["TA"]
-        )
-        metric = {
-            "VQ": scaled["VQ"],
-            "MQ": scaled["MQ"],
-            "TA": scaled["TA"],
-            "VQ_raw": raw["VQ"],
-            "MQ_raw": raw["MQ"],
-            "TA_raw": raw["TA"],
-            "composite": composite,
+        coef_map = {"VQ": float(vq_coef), "MQ": float(mq_coef), "TA": float(ta_coef)}
+        composite = sum(coef_map[dim] * scaled[dim] for dim in dimensions)
+        metric: Dict[str, Any] = {
             "score_scale": score_scale,
+            "dimensions": list(dimensions),
         }
+        for dim in dimensions:
+            metric[dim] = scaled[dim]
+            metric[f"{dim}_raw"] = raw[dim]
+        metric["composite"] = composite
         if errors:
             metric["errors"] = errors
         if return_responses:
@@ -647,6 +646,21 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
         fallback_value = float(payload.get("fallback_value", 0.0))
         return_responses = bool(payload.get("return_responses", False))
 
+        dims_raw = payload.get("dimensions")
+        if dims_raw is None:
+            dimensions: Tuple[str, ...] = ("VQ", "MQ", "TA")
+        else:
+            if not isinstance(dims_raw, list) or not all(isinstance(d, str) for d in dims_raw):
+                raise TypeError("`dimensions` must be a list[str] drawn from VQ/MQ/TA")
+            dimensions = tuple(d.upper() for d in dims_raw)
+            invalid = [d for d in dimensions if d not in DIMENSIONS]
+            if invalid:
+                raise ValueError(
+                    f"invalid dimensions {invalid}; choose from {list(DIMENSIONS)}"
+                )
+            if not dimensions:
+                raise ValueError("`dimensions` must be a non-empty subset of VQ/MQ/TA")
+
         rewards: List[float] = []
         metrics: List[Dict[str, Any]] = []
 
@@ -659,6 +673,7 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     vq_coef,
                     mq_coef,
                     ta_coef,
+                    dimensions,
                 )
                 cached = self.server.cache.get(cache_key)
                 if cached is not None:
@@ -680,6 +695,7 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
                     score_scale=score_scale,
                     fallback_value=fallback_value,
                     return_responses=return_responses,
+                    dimensions=dimensions,
                 )
                 if "errors" not in metric:
                     self.server.cache.put(cache_key, dict(metric))

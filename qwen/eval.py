@@ -40,8 +40,28 @@ pd = None
 requests = None
 tqdm = None
 
-REQUIRED_METRIC_KEYS = ("VQ", "MQ", "TA", "composite")
-REQUIRED_SCORE_COLUMNS = ("reward_VQ", "reward_MQ", "reward_TA", "reward_Overall")
+ALL_DIMENSIONS = ("VQ", "MQ", "TA")
+
+
+def parse_dimensions(raw: str) -> List[str]:
+    parts = [p.strip().upper() for p in str(raw).split(",") if p.strip()]
+    if not parts:
+        raise ValueError("--dimensions must list at least one of VQ,MQ,TA")
+    seen: List[str] = []
+    for p in parts:
+        if p not in ALL_DIMENSIONS:
+            raise ValueError(f"invalid dimension {p!r}; choose from {ALL_DIMENSIONS}")
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+def metric_keys_for(dims: List[str]) -> tuple:
+    return tuple(dims) + ("composite",)
+
+
+def score_columns_for(dims: List[str]) -> tuple:
+    return tuple(f"reward_{d}" for d in dims) + ("reward_Overall",)
 
 
 def default_posttrain_root() -> Path:
@@ -134,6 +154,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--server-url", default="http://127.0.0.1:18080")
+    parser.add_argument(
+        "--dimensions",
+        default="MQ",
+        help="Comma-separated subset of VQ,MQ,TA to ask Qwen to score, e.g. 'MQ'. "
+        "Unselected dimensions are left blank in the score/human CSVs.",
+    )
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--retry-attempts", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
@@ -149,8 +175,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore existing qwen_reward_scores.csv and score all rows again.",
     )
+    parser.add_argument(
+        "--human-ground-truth",
+        default=str(Path(__file__).resolve().parent / "human_ground_truth.csv"),
+        help="Fixed human scores keyed by prompt text. Auto-filled into human_pointwise.csv "
+        "so deterministic Wan videos never need re-scoring. Set to '' to disable.",
+    )
+    parser.add_argument(
+        "--strict-ground-truth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fail if a scored video's prompt is missing from the ground truth, instead of "
+        "silently leaving human_* blank. Guards against prompts/videos no longer being fixed.",
+    )
     parser.add_argument("--log-level", default="INFO")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.dim_list = parse_dimensions(args.dimensions)
+    return args
 
 
 def run_wan_generation(args: argparse.Namespace) -> Path:
@@ -247,7 +288,9 @@ class QwenServerClient:
             "score_scale": "raw",
             "fallback_value": args.fallback_value,
             "return_responses": args.return_responses,
+            "dimensions": args.dim_list,
         }
+        required_keys = metric_keys_for(args.dim_list)
         last_err: Optional[BaseException] = None
         for attempt in range(self.retries):
             try:
@@ -264,7 +307,7 @@ class QwenServerClient:
                 if not isinstance(metrics, list) or len(metrics) != 1:
                     raise RuntimeError(f"invalid metrics from server: {data}")
                 metric = metrics[0]
-                missing_keys = [key for key in REQUIRED_METRIC_KEYS if key not in metric]
+                missing_keys = [key for key in required_keys if key not in metric]
                 if missing_keys:
                     raise RuntimeError(
                         f"Qwen reward server response missing metric keys {missing_keys}: {metric}"
@@ -294,14 +337,14 @@ def load_existing_scores(path: Path):
     return pd_mod.read_csv(path)
 
 
-def split_complete_existing_scores(existing):
+def split_complete_existing_scores(existing, required_columns):
     if existing.empty:
         return set(), []
     if "video_id" not in existing.columns:
         logger.warning("existing score CSV has no video_id column; rescoring all rows")
         return set(), []
 
-    missing_columns = [col for col in REQUIRED_SCORE_COLUMNS if col not in existing.columns]
+    missing_columns = [col for col in required_columns if col not in existing.columns]
     if missing_columns:
         logger.warning(
             "existing score CSV missing required columns %s; rescoring all rows",
@@ -309,7 +352,7 @@ def split_complete_existing_scores(existing):
         )
         return set(), []
 
-    complete_mask = existing[list(REQUIRED_SCORE_COLUMNS)].notna().all(axis=1)
+    complete_mask = existing[list(required_columns)].notna().all(axis=1)
     complete = existing[complete_mask].copy()
     incomplete_count = int((~complete_mask).sum())
     if incomplete_count:
@@ -320,24 +363,56 @@ def split_complete_existing_scores(existing):
     return set(complete["video_id"].astype(str)), complete.to_dict("records")
 
 
-def metric_to_row(meta_row: Mapping[str, Any], metric: Mapping[str, Any]) -> Dict[str, Any]:
-    return {
+def metric_to_row(
+    meta_row: Mapping[str, Any],
+    metric: Mapping[str, Any],
+    dims: List[str],
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
         "video_id": meta_row["video_id"],
         "prompt_id": int(meta_row["prompt_id"]),
         "seed_offset": int(meta_row["seed_offset"]),
         "seed": int(meta_row["seed"]),
         "prompt": meta_row["prompt"],
         "video_path": meta_row["video_path"],
-        "reward_VQ": float(metric["VQ"]),
-        "reward_MQ": float(metric["MQ"]),
-        "reward_TA": float(metric["TA"]),
-        "reward_Overall": float(metric["composite"]),
-        "score_scale": metric.get("score_scale", "raw"),
-        "errors": json.dumps(metric.get("errors", {}), ensure_ascii=False),
     }
+    selected = set(dims)
+    for dim in ALL_DIMENSIONS:
+        row[f"reward_{dim}"] = float(metric[dim]) if dim in selected else None
+    row["reward_Overall"] = float(metric["composite"])
+    row["scored_dimensions"] = ",".join(dims)
+    row["score_scale"] = metric.get("score_scale", "raw")
+    row["errors"] = json.dumps(metric.get("errors", {}), ensure_ascii=False)
+    return row
 
 
-def write_human_template(scores_csv: Path) -> Path:
+HUMAN_COLUMNS = ("human_VQ", "human_MQ", "human_TA", "human_notes")
+
+
+def _normalize_prompt(value: Any) -> str:
+    return str(value).strip()
+
+
+def load_ground_truth(path: Optional[Path]):
+    pd_mod = ensure_pandas()
+    if path is None:
+        return None
+    if not path.exists():
+        logger.warning("human ground truth not found at %s; human sheet will be blank", path)
+        return None
+    gt = pd_mod.read_csv(path)
+    if "prompt" not in gt.columns:
+        raise ValueError(f"ground truth {path} must have a 'prompt' column to key on")
+    gt = gt.copy()
+    gt["_prompt_key"] = gt["prompt"].map(_normalize_prompt)
+    dup = int(gt["_prompt_key"].duplicated().sum())
+    if dup:
+        logger.warning("ground truth has %s duplicate prompt key(s); keeping first", dup)
+        gt = gt.drop_duplicates("_prompt_key", keep="first")
+    return gt.set_index("_prompt_key")
+
+
+def write_human_template(scores_csv: Path, args: argparse.Namespace) -> Path:
     pd_mod = ensure_pandas()
     df = pd_mod.read_csv(scores_csv)
     human = df[
@@ -353,9 +428,60 @@ def write_human_template(scores_csv: Path) -> Path:
             "reward_Overall",
         ]
     ].copy()
-    for col in ("human_VQ", "human_MQ", "human_TA", "human_notes"):
+    for col in HUMAN_COLUMNS:
         human[col] = ""
+
+    gt_path = (
+        Path(args.human_ground_truth).resolve()
+        if getattr(args, "human_ground_truth", "")
+        else None
+    )
+    gt = load_ground_truth(gt_path)
     out_path = scores_csv.parent / "human_pointwise.csv"
+
+    if gt is None:
+        human.to_csv(out_path, index=False)
+        return out_path
+
+    # Align on the prompt TEXT (the instruction), not video_id: video_id is only a
+    # positional label, so keying on the prompt makes any drift in the fixed
+    # prompt/video set visible instead of silently mapping the wrong human score.
+    gt_human_cols = [c for c in HUMAN_COLUMNS if c in gt.columns]
+    keys = human["prompt"].map(_normalize_prompt)
+    matched = 0
+    unmatched: List[str] = []
+    for idx, key in keys.items():
+        if key in gt.index:
+            matched += 1
+            for col in gt_human_cols:
+                val = gt.at[key, col]
+                human.at[idx, col] = "" if pd_mod.isna(val) else val
+        else:
+            unmatched.append(str(human.at[idx, "video_id"]))
+
+    run_keys = set(keys.tolist())
+    gt_only = [k for k in gt.index if k not in run_keys]
+
+    total = len(human)
+    logger.info("ground truth matched %s/%s scored videos by prompt", matched, total)
+    if unmatched:
+        logger.warning(
+            "%s scored video(s) have NO prompt match in ground truth (human_* left blank): %s",
+            len(unmatched),
+            unmatched,
+        )
+    if gt_only:
+        logger.warning(
+            "%s ground-truth prompt(s) were NOT produced in this run", len(gt_only)
+        )
+    if unmatched and getattr(args, "strict_ground_truth", False):
+        raise RuntimeError(
+            f"--strict-ground-truth: {len(unmatched)} scored video(s) had no matching "
+            f"prompt in {gt_path}. The prompt/video set is no longer fixed as expected. "
+            f"Offending video_ids: {unmatched}. Wrote scores to {scores_csv} but refused "
+            f"to write a possibly-misaligned human sheet."
+        )
+
     human.to_csv(out_path, index=False)
     return out_path
 
@@ -368,11 +494,12 @@ def score_videos(args: argparse.Namespace, meta_csv: Path) -> Path:
     responses_path = out_dir / "qwen_responses.jsonl"
 
     meta = pd_mod.read_csv(meta_csv).head(args.num_videos).copy()
+    required_columns = score_columns_for(args.dim_list)
     existing = load_existing_scores(scores_csv)
     done_ids = set()
     rows: List[Dict[str, Any]] = []
     if not args.no_resume_score and not existing.empty:
-        done_ids, rows = split_complete_existing_scores(existing)
+        done_ids, rows = split_complete_existing_scores(existing, required_columns)
         logger.info("resuming Qwen scores: %s existing rows", len(done_ids))
 
     client = QwenServerClient(args)
@@ -384,7 +511,7 @@ def score_videos(args: argparse.Namespace, meta_csv: Path) -> Path:
         if not video_path.exists():
             raise FileNotFoundError(f"generated video not found: {video_path}")
         metric = client.score_one(video_path, str(row["prompt"]), args)
-        rows.append(metric_to_row(row, metric))
+        rows.append(metric_to_row(row, metric, args.dim_list))
         pd_mod.DataFrame(rows).to_csv(scores_csv, index=False)
 
         if args.return_responses or "errors" in metric:
@@ -424,12 +551,14 @@ def main() -> None:
     else:
         meta_csv = run_wan_generation(args)
 
+    logger.info("scoring dimensions: %s", ",".join(args.dim_list))
     scores_csv = score_videos(args, meta_csv)
-    human_csv = write_human_template(scores_csv)
+    human_csv = write_human_template(scores_csv, args)
     print(f"[done] generated videos: {out_dir / 'videos'}")
     print(f"[done] metadata:         {meta_csv}")
     print(f"[done] Qwen raw scores:  {scores_csv}")
     print(f"[done] human sheet:      {human_csv}")
+    print(f"[done] scored dimensions: {','.join(args.dim_list)} (unselected reward_* left blank)")
     print("[done] reward columns are raw Qwen scores: reward_VQ, reward_MQ, reward_TA.")
 
 
