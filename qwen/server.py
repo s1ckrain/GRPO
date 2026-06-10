@@ -212,6 +212,21 @@ def extract_score_from_json(
     return float(score)
 
 
+def parse_winner(payload: Mapping[str, Any]) -> str:
+    if "winner" not in payload:
+        raise KeyError("missing 'winner' key in response JSON")
+    value = payload["winner"]
+    if isinstance(value, bool) or value is None:
+        raise TypeError(f"invalid winner value: {value!r}")
+    text = str(value).strip().upper()
+    if text in {"A", "B"}:
+        return text
+    match = re.search(r"[AB]", text)
+    if match:
+        return match.group(0)
+    raise ValueError(f"could not parse winner 'A'/'B' from {value!r}")
+
+
 def b64_to_file(data_b64: str, out_path: str) -> None:
     with open(out_path, "wb") as f:
         f.write(base64.b64decode(data_b64))
@@ -409,6 +424,32 @@ class Qwen3VLJudge:
             metric["responses"] = responses
         return metric
 
+    def compare_videos(
+        self,
+        video_a_path: str,
+        video_b_path: str,
+        instruction: str,
+        *,
+        prompt: Optional[str] = None,
+        return_responses: bool = False,
+    ) -> Dict[str, Any]:
+        text_prompt = instruction.rstrip()
+        if prompt:
+            text_prompt = f"{text_prompt}\n{prompt.strip()}"
+        result: Dict[str, Any] = {}
+        response_text = ""
+        try:
+            response_text = self._generate_pair(video_a_path, video_b_path, text_prompt)
+            parsed = extract_first_json_object(response_text)
+            result["winner"] = parse_winner(parsed)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("failed to compare %s vs %s: %s", video_a_path, video_b_path, e)
+            result["winner"] = None
+            result["error"] = str(e)
+        if return_responses:
+            result["response"] = response_text
+        return result
+
     def _score_dimension(
         self,
         *,
@@ -456,7 +497,7 @@ class Qwen3VLJudge:
             return float(raw_score) / 5.0
         raise ValueError(f"score_scale must be 'raw' or 'unit', got {score_scale!r}")
 
-    def _generate(self, video_path: str, text_prompt: str) -> str:
+    def _video_item(self, video_path: str) -> Dict[str, Any]:
         video_item: Dict[str, Any] = {
             "type": "video",
             "video": video_path,
@@ -470,17 +511,38 @@ class Qwen3VLJudge:
             video_item["total_pixels"] = int(self.video_total_pixels)
         if self.video_nframes is not None:
             video_item["nframes"] = int(self.video_nframes)
+        return video_item
 
+    def _generate(self, video_path: str, text_prompt: str) -> str:
         messages = [
             {
                 "role": "user",
                 "content": [
-                    video_item,
+                    self._video_item(video_path),
                     {"type": "text", "text": text_prompt},
                 ],
             }
         ]
+        return self._run_generation(messages)
 
+    def _generate_pair(
+        self, video_a_path: str, video_b_path: str, text_prompt: str
+    ) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "视频A："},
+                    self._video_item(video_a_path),
+                    {"type": "text", "text": "视频B："},
+                    self._video_item(video_b_path),
+                    {"type": "text", "text": text_prompt},
+                ],
+            }
+        ]
+        return self._run_generation(messages)
+
+    def _run_generation(self, messages: List[Dict[str, Any]]) -> str:
         text = self.processor.apply_chat_template(
             messages,
             tokenize=False,
@@ -602,13 +664,17 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"error": f"unknown endpoint: {self.path}"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.rstrip("/") != "/compute":
+        route = self.path.rstrip("/")
+        if route not in {"/compute", "/compare"}:
             self._send_json({"error": f"unknown endpoint: {self.path}"}, HTTPStatus.NOT_FOUND)
             return
 
         try:
             payload = self._read_json()
-            result = self._handle_compute(payload)
+            if route == "/compare":
+                result = self._handle_compare(payload)
+            else:
+                result = self._handle_compute(payload)
             self._send_json(result)
         except Exception as e:  # noqa: BLE001
             logger.exception("request failed")
@@ -623,6 +689,55 @@ class RewardRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(data, dict):
             raise TypeError("request body must be a JSON object")
         return data
+
+    def _handle_compare(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        instruction = payload.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise TypeError("`instruction` must be a non-empty string (the pairwise judge prompt)")
+
+        videos_a = payload.get("videos_a")
+        videos_b = payload.get("videos_b")
+        if not isinstance(videos_a, list) or not all(isinstance(v, str) for v in videos_a):
+            raise TypeError("`videos_a` must be a list[str] of base64-encoded mp4 bytes")
+        if not isinstance(videos_b, list) or not all(isinstance(v, str) for v in videos_b):
+            raise TypeError("`videos_b` must be a list[str] of base64-encoded mp4 bytes")
+        if len(videos_a) != len(videos_b):
+            raise ValueError(
+                f"len(videos_a)={len(videos_a)} != len(videos_b)={len(videos_b)}"
+            )
+
+        prompts = payload.get("prompts")
+        if prompts is not None:
+            if not isinstance(prompts, list) or not all(isinstance(p, str) for p in prompts):
+                raise TypeError("`prompts` must be a list[str] when provided")
+            if len(prompts) != len(videos_a):
+                raise ValueError(
+                    f"len(prompts)={len(prompts)} != len(videos_a)={len(videos_a)}"
+                )
+
+        return_responses = bool(payload.get("return_responses", False))
+
+        results: List[Dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix="qwen3vl_compare_") as tmpdir:
+            for idx, (va_b64, vb_b64) in enumerate(zip(videos_a, videos_b)):
+                path_a = os.path.abspath(os.path.join(tmpdir, f"pair_{idx:04d}_A.mp4"))
+                path_b = os.path.abspath(os.path.join(tmpdir, f"pair_{idx:04d}_B.mp4"))
+                b64_to_file(va_b64, path_a)
+                b64_to_file(vb_b64, path_b)
+                prompt = prompts[idx] if prompts is not None else None
+                result = self.server.judge.compare_videos(
+                    path_a,
+                    path_b,
+                    instruction,
+                    prompt=prompt,
+                    return_responses=return_responses,
+                )
+                results.append(result)
+
+        return {
+            "error": None,
+            "results": results,
+        }
 
     def _handle_compute(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         prompts = payload.get("prompts", payload.get("prompt"))
