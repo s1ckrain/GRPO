@@ -120,12 +120,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default=str(root / "GRPO/qwen3vl-2fps-reward"),
+        default=str(root / "GRPO/ov-16frames"),
         help="Output directory for generated videos and score CSVs.",
     )
     parser.add_argument(
         "--model-name",
-        default="/aigc/posttrain/siyuanfu/models/Wan2.1-Reward",
+        default="/aigc/posttrain/siyuanfu/models/Wan2.1",
         help="Wan2.1 diffusers model path/id passed to VideoAlign/wan_eval/generate.py.",
     )
     parser.add_argument("--gpu", type=int, default=0, help="GPU index for Wan generation.")

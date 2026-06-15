@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-MODEL_PATH="${OV_MODEL_PATH:-lmms-lab-encoder/LLaVA-OneVision-2-8B-Instruct}"
+MODEL_PATH="${OV_MODEL_PATH:-/aigc/posttrain/siyuanfu/models/OneVision}"
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-18080}"
