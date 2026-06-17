@@ -73,6 +73,7 @@ class OneVision2Judge:
         self.snap_scores = bool(args.snap_scores)
         self.prompts = self._load_prompts(args)
         self.model_lock = threading.Lock()
+        self._logged_inputs = False
 
         self.processor, self.model = self._load_model(args)
         logger.info(
@@ -324,11 +325,17 @@ class OneVision2Judge:
             tokenize=False,
             add_generation_prompt=True,
         )
-        proc_kwargs: Dict[str, Any] = {"video_backend": self.video_backend}
-        if self.video_nframes is not None:
-            proc_kwargs["num_frames"] = int(self.video_nframes)
-        if self.video_max_pixels is not None:
-            proc_kwargs["max_pixels"] = int(self.video_max_pixels)
+        # Match the LLaVA-OneVision-2-8B model card exactly:
+        #   frames backend -> pass num_frames; max_pixels is set on processor.video_processor
+        #   codec  backend -> pass video_backend="codec" + max_pixels
+        proc_kwargs: Dict[str, Any] = {}
+        if self.video_backend == "codec":
+            proc_kwargs["video_backend"] = "codec"
+            if self.video_max_pixels is not None:
+                proc_kwargs["max_pixels"] = int(self.video_max_pixels)
+        else:
+            if self.video_nframes is not None:
+                proc_kwargs["num_frames"] = int(self.video_nframes)
 
         inputs = self.processor(
             text=[text],
@@ -337,6 +344,36 @@ class OneVision2Judge:
             padding=True,
             **proc_kwargs,
         )
+
+        # One-time sanity log so you can SEE whether the video actually reached the
+        # model (vision token tensors present + how many vision tokens in the prompt).
+        if not self._logged_inputs:
+            self._logged_inputs = True
+            vis_keys = {
+                k: tuple(getattr(v, "shape", ()))
+                for k, v in inputs.items()
+                if any(t in k.lower() for t in ("pixel", "video", "image", "grid"))
+            }
+            n_vision_tokens = None
+            try:
+                ids = inputs["input_ids"][0].tolist()
+                vid_tok = self.processor.tokenizer.convert_tokens_to_ids("<|video_pad|>")
+                img_tok = self.processor.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+                n_vision_tokens = sum(1 for t in ids if t in (vid_tok, img_tok))
+            except Exception:  # noqa: BLE001
+                pass
+            logger.info(
+                "first generation: input keys=%s | vision tensors=%s | vision tokens in prompt=%s",
+                list(inputs.keys()),
+                vis_keys,
+                n_vision_tokens,
+            )
+            if not vis_keys:
+                logger.warning(
+                    "NO vision tensors in processor output -- the video was NOT encoded. "
+                    "The model is scoring TEXT ONLY (this explains constant scores)."
+                )
+
         inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
 
         with self.model_lock, torch.inference_mode():
